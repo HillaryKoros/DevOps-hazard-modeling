@@ -5,6 +5,9 @@ import tempfile
 from datetime import datetime, timedelta
 from glob import glob
 from urllib.parse import urljoin, urlparse
+import psutil
+import math
+
 
 import numpy as np
 import pandas as pd
@@ -554,5 +557,150 @@ def make_zones_geotif(shapefl_name,km_str,zone_str):
         dst.write(raster, 1)
     #print(f"Raster TIFF file saved to {output_tiff_path}")
     return output_tiff_path
+
+
+
+def get_dask_client_params():
+    # Get number of CPU cores (leave 1 for the OS)
+    n_workers = max(1, psutil.cpu_count(logical=False) - 1)
+    
+    # Assuming hyperthreading is available
+    threads_per_worker = 2
+    
+    # Calculate available memory per worker (in GB)
+    total_memory = psutil.virtual_memory().total / (1024**3)  # Convert to GB
+    memory_per_worker = math.floor(total_memory / n_workers * 0.75)  # Use 75% of available memory
+    
+    return {
+        "n_workers": n_workers,
+        "threads_per_worker": threads_per_worker,
+        "memory_limit": f"{memory_per_worker}GB"
+    }
+
+
+def pet_extend_forecast(df, date_column, days_to_add=18):
+    """
+    Add a specified number of days to the last date in a DataFrame, 
+    repeating all values from the last row for non-date columns.
+    
+    Parameters:
+    df (pd.DataFrame): Input DataFrame
+    date_column (str): Name of the column containing dates in 'YYYYDDD' format
+    days_to_add (int): Number of days to add (default is 18)
+    
+    Returns:
+    pd.DataFrame: DataFrame with additional rows
+    """
+    
+    def safe_to_datetime(date_str):
+        try:
+            return datetime.strptime(str(date_str), '%Y%j')
+        except ValueError:
+            return None
+
+    # Create a copy of the input DataFrame to avoid modifying the original
+    df = df.copy()
+    
+    # Convert date column to datetime
+    df[date_column] = df[date_column].apply(safe_to_datetime)
+    
+    # Remove any rows where the date conversion failed
+    df = df.dropna(subset=[date_column])
+    
+    if not df.empty:
+        # Get the last row
+        last_row = df.iloc[-1]
+        
+        # Create a list of new dates
+        last_date = last_row[date_column]
+        new_dates = [last_date + timedelta(days=i+1) for i in range(days_to_add)]
+        
+        # Create new rows
+        new_rows = []
+        for new_date in new_dates:
+            new_row = last_row.copy()
+            new_row[date_column] = new_date
+            new_rows.append(new_row)
+        
+        # Convert new_rows to a DataFrame
+        new_rows_df = pd.DataFrame(new_rows)
+        
+        # Concatenate the new rows to the original DataFrame
+        df = pd.concat([df, new_rows_df], ignore_index=True)
+        
+        # Convert date column back to the original string format
+        df[date_column] = df[date_column].dt.strftime('%Y%j')
+    else:
+        print(f"No valid dates found in the '{date_column}' column.")
+    
+    return df
+
+
+def regrid_dataset(input_ds, input_chunk_sizes, output_chunk_sizes, zone_extent, regrid_method="bilinear"):
+    """
+    Regrid a dataset to a specified output grid using a specified regridding method.
+
+    Parameters:
+    ----------
+    input_ds : xarray.Dataset
+        The input dataset to be regridded.
+
+    input_chunk_sizes : dict
+        A dictionary specifying the chunk sizes for the input dataset, e.g., {'time': 10, 'lat': 30, 'lon': 30}.
+
+    output_chunk_sizes : dict
+        A dictionary specifying the chunk sizes for the output dataset, e.g., {'lat': 300, 'lon': 300}.
+
+    zone_extent : dict
+        A dictionary specifying the latitude and longitude extents of the output grid. 
+        Should contain the keys 'lat_min', 'lat_max', 'lon_min', 'lon_max' with respective values.
+
+    regrid_method : str, optional
+        The method used for regridding. Default is "bilinear". Other methods can be used if supported by `xesmf.Regridder`.
+
+    Returns:
+    -------
+    xarray.Dataset
+        The regridded dataset.
+
+    Example:
+    -------
+    input_ds = xr.open_dataset("your_input_data.nc")
+    input_chunk_sizes = {'time': 10, 'lat': 30, 'lon': 30}
+    output_chunk_sizes = {'lat': 300, 'lon': 300}
+    zone_extent = {'lat_min': 0, 'lat_max': 30, 'lon_min': 0, 'lon_max': 30}
+
+    regridded_ds = regrid_dataset(input_ds, input_chunk_sizes, output_chunk_sizes, zone_extent)
+    """
+
+    # Extract lat/lon extents from the dictionary
+    z1lat_min = zone_extent['lat_min']
+    z1lat_max = zone_extent['lat_max']
+    z1lon_min = zone_extent['lon_min']
+    z1lon_max = zone_extent['lon_max']
+
+    # Create output grid with appropriate chunking
+    ds_out = xr.Dataset({
+        "lat": (["lat"], np.arange(z1lat_min, z1lat_max, 0.01), {"units": "degrees_north"}),
+        "lon": (["lon"], np.arange(z1lon_min, z1lon_max, 0.01), {"units": "degrees_east"})
+    }).chunk(output_chunk_sizes)
+
+    # Create regridder with specified output_chunks
+    regridder = xe.Regridder(input_ds, ds_out, regrid_method)
+
+    # Define regridding function with output_chunks
+    def regrid_chunk(chunk):
+        return regridder(chunk, output_chunks=output_chunk_sizes)
+
+    # Apply regridding to each chunk
+    regridded = input_ds.groupby('time').map(regrid_chunk)
+
+    # Compute results
+    with ProgressBar():
+        result = regridded.compute()
+
+    print("Regridding complete. Result shape:", result.shape)
+    return result
+
 
 
