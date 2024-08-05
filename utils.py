@@ -225,8 +225,11 @@ def imerg_extract_date_from_filename(filename):
     date_str = filename.split('3IMERG.')[1][:8]
     return datetime.strptime(date_str, '%Y%m%d')
 
-def imerg_read_tiffs_to_dataset(folder_path):
+def imerg_read_tiffs_to_dataset(folder_path, start_date, end_date):
     # Get list of tif files
+    start_date = pd.to_datetime(start_date)
+    end_date = pd.to_datetime(end_date)
+
     tif_files = [f for f in os.listdir(folder_path) if f.endswith('.tif') and '3IMERG.' in f]
     
     # Extract dates and sort files
@@ -234,8 +237,8 @@ def imerg_read_tiffs_to_dataset(folder_path):
     date_file_pairs.sort(key=lambda x: x[0])
     
     # Create a complete date range
-    start_date = date_file_pairs[0][0]
-    end_date = date_file_pairs[-1][0]
+    #start_date = date_file_pairs[0][0]
+    #end_date = date_file_pairs[-1][0]
     all_dates = pd.date_range(start=start_date, end=end_date, freq='D')
     
     # Create dataset
@@ -246,14 +249,18 @@ def imerg_read_tiffs_to_dataset(folder_path):
         if matching_files:
             file_path = os.path.join(folder_path, matching_files[0])
             with rioxarray.open_rasterio(file_path) as da:
-                da = da.squeeze().drop_vars('band')  # Remove band dimension if it exists
-                da = da.expand_dims(time=[date])  # Add time dimension
-                dataset_list.append(da)
+                da = da.squeeze().drop_vars('band',errors='raise')  # Remove band dimension if it exists
+                da = da.astype('float32')  # Convert data to float if it's not already
+                da = da.where(da != 29999, np.nan)
+                da1=da/10
+                da1 = da1.expand_dims(time=[date])  # Add time dimension
+                dataset_list.append(da1)
         else:
+            pass
             # Create a dummy dataset with NaN values for missing dates
-            dummy_da = xr.full_like(dataset_list[-1] if dataset_list else None, float('nan'))
-            dummy_da = dummy_da.expand_dims(time=[date])
-            dataset_list.append(dummy_da)
+            #dummy_da = xr.full_like(dataset_list[-1] if dataset_list else None, float('nan'))
+            #dummy_da = dummy_da.expand_dims(time=[date])
+            #dataset_list.append(dummy_da)
     
     # Combine all datasets
     combined_ds = xr.concat(dataset_list, dim='time')
@@ -320,7 +327,7 @@ def pet_list_files_by_date(url, start_date, end_date):
     return sorted_unique_data
 
 
-def pet_download_extract_ncfile_create(file_url, date, output_dir,netcdf_path):
+def pet_download_extract_bilfile(file_url, output_dir):
     # Download the file
     '''
     output_dir=f'{input_path}PET/dir/'
@@ -342,23 +349,61 @@ def pet_download_extract_ncfile_create(file_url, date, output_dir,netcdf_path):
         with tarfile.open(temp_file_path, 'r:gz') as tar:
             tar.extractall(path=output_dir)
         
-        # Find and process the .bil file
-        for root, dirs, files in os.walk(output_dir):
-            for file in files:
-                if file.endswith('.bil'):
-                    bil_path = os.path.join(root, file)
-                    # Open the .bil file as an xarray dataset
-                    with rioxarray.open_rasterio(bil_path) as xds:
-                        # Process or save the xarray dataset as needed
-                        # For example, you can save it as a NetCDF file
-                        ncname=date.strftime('%Y%m%d')
-                        nc_path = os.path.join(netcdf_path, f"{ncname}.nc")
-                        xds.to_netcdf(nc_path)
-                        print(f"Converted {bil_path} to {nc_path}")
-                    return 'xds'  # Return the xarray dataset
     finally:
         # Clean up the temporary file
         os.unlink(temp_file_path)
+
+def pet_bil_netcdf(file_url,date,bil_path,netcdf_path):
+    '''
+    Pass the url and make the bil file into netcdf with date as file name
+    '''
+
+   
+    basename = os.path.basename(file_url[0])
+    bil_name = os.path.splitext(os.path.splitext(basename)[0])[0] + '.bil'
+    bil_path = os.path.join(bil_path, bil_name)
+    # Open the .bil file as an xarray dataset
+    with rioxarray.open_rasterio(bil_path) as xds:
+        # Process or save the xarray dataset as needed
+        # For example, you can save it as a NetCDF file
+       ncname=date.strftime('%Y%m%d')
+       nc_path = os.path.join(netcdf_path, f"{ncname}.nc")
+       xds.to_netcdf(nc_path)
+       print(f"Converted {bil_path} to {nc_path}")
+    return 'xds'  # Return the xarray dataset
+
+
+def pet_find_missing_dates(folder_path):
+    # Get list of files in the folder
+    files = [f for f in os.listdir(folder_path) if f.endswith('.nc')]
+    
+    # Extract dates from filenames
+    dates = [datetime.strptime(f[:8], '%Y%m%d') for f in files]
+    
+    # Create a DataFrame with these dates
+    df = pd.DataFrame({'date': dates})
+    df = df.sort_values('date')
+    
+    # Get the start and end dates
+    start_date = df['date'].min()
+    end_date = df['date'].max()
+    
+    # Create a complete date range
+    all_dates = pd.date_range(start=start_date, end=end_date, freq='D')
+    
+    # Find missing dates
+    missing_dates = all_dates[~all_dates.isin(df['date'])]
+    
+    return missing_dates, all_dates
+
+def pet_find_last_available(date, available_dates):
+    last_date = None
+    for avail_date in available_dates:
+        if avail_date <= date:
+            last_date = avail_date
+        else:
+            break
+    return last_date
 
 
 def pet_read_netcdf_files_in_date_range(folder_path, start_date, end_date):
@@ -416,9 +461,66 @@ def pet_read_netcdf_files_in_date_range(folder_path, start_date, end_date):
     
     return combined_dataset
 
+def pet_extend_forecast(df, date_column, days_to_add=18):
+    """
+    Add a specified number of days to the last date in a DataFrame, 
+    repeating all values from the last row for non-date columns.
+    
+    Parameters:
+    df (pd.DataFrame): Input DataFrame
+    date_column (str): Name of the column containing dates in 'YYYYDDD' format
+    days_to_add (int): Number of days to add (default is 18)
+    
+    Returns:
+    pd.DataFrame: DataFrame with additional rows
+    """
+    
+    # Function to safely convert date string to datetime
+    def safe_to_datetime(date_str):
+        try:
+            return datetime.strptime(str(date_str), '%Y%j')
+        except ValueError:
+            return None
+
+    # Create a copy of the input DataFrame to avoid modifying the original
+    df = df.copy()
+    
+    # Convert date column to datetime
+    df[date_column] = df[date_column].apply(safe_to_datetime)
+    
+    # Remove any rows where the date conversion failed
+    df = df.dropna(subset=[date_column])
+    
+    if not df.empty:
+        # Get the last row
+        last_row = df.iloc[-1]
+        
+        # Create a list of new dates
+        last_date = last_row[date_column]
+        new_dates = [last_date + timedelta(days=i+1) for i in range(days_to_add)]
+        
+        # Create new rows
+        new_rows = []
+        for new_date in new_dates:
+            new_row = last_row.copy()
+            new_row[date_column] = new_date
+            new_rows.append(new_row)
+        
+        # Convert new_rows to a DataFrame
+        new_rows_df = pd.DataFrame(new_rows)
+        
+        # Concatenate the new rows to the original DataFrame
+        df = pd.concat([df, new_rows_df], ignore_index=True)
+        
+        # Convert date column back to the original string format
+        df[date_column] = df[date_column].dt.strftime('%Y%j')
+    else:
+        print(f"No valid dates found in the '{date_column}' column.")
+    
+    return df
 
 
-def make_zones_geotif(shapefl_name,km_str):
+def make_zones_geotif(shapefl_name,km_str,zone_str):
     gdf=gp.read_file(shapefl_name)
     # Define the output raster properties
     pixel_size = km_str/100  # Define the pixel size (adjust as needed)
@@ -430,12 +532,12 @@ def make_zones_geotif(shapefl_name,km_str):
     # Create an empty array to hold the rasterized data
     raster = np.zeros((height, width), dtype=np.uint16)
     # Generate shapes (geometry, value) for rasterization
-    shapes = ((geom, value) for geom, value in zip(gdf.geometry, gdf['id']))
+    shapes = ((geom, value) for geom, value in zip(gdf.geometry, gdf['GRIDCODE']))
     # Rasterize the shapes into the array
     raster = rasterize(shapes, out_shape=raster.shape, transform=transform, fill=0, dtype=np.uint16)
     output_tiff_path = os.path.dirname(shapefl_name)
     # Save the raster to a TIFF file
-    output_tiff_path = f'{output_tiff_path}/ea_geofsm_prod_zones_{km_str}km.tif'
+    output_tiff_path = f'{output_tiff_path}/ea_geofsm_prod_{zone_str}_{km_str}km.tif'
     with rasterio.open(
         output_tiff_path,
         'w',
