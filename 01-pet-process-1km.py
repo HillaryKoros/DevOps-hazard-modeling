@@ -48,3 +48,20 @@ for file_url, date in pet_list:
 pds=pet_read_netcdf_files_in_date_range(netcdf_path, start_date, end_date)
 pds = pds.rename(x='lon', y='lat')
 
+
+params = get_dask_client_paramsclient = Client(**params)
+
+
+input_chunk_sizes = {'time': 10, 'lat': 30, 'lon': 30}
+output_chunk_sizes = {'lat': 300, 'lon': 300}
+
+# Call the function with the dictionary
+z1ds = regrid_dataset(
+    pds,
+    input_chunk_sizes,
+    output_chunk_sizes,
+    zone_extent,
+    regrid_method="bilinear"
+)
+
+
