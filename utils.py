@@ -5,9 +5,6 @@ import tempfile
 from datetime import datetime, timedelta
 from glob import glob
 from urllib.parse import urljoin, urlparse
-import psutil
-import math
-
 
 import numpy as np
 import pandas as pd
@@ -356,21 +353,23 @@ def pet_download_extract_bilfile(file_url, output_dir):
         # Clean up the temporary file
         os.unlink(temp_file_path)
 
-def pet_bil_netcdf(file_url,date,bil_path,netcdf_path):
+def pet_bil_netcdf(file_url,date,output_dir,netcdf_dir):
     '''
     Pass the url and make the bil file into netcdf with date as file name
     '''
-
-   
-    basename = os.path.basename(file_url[0])
-    bil_name = os.path.splitext(os.path.splitext(basename)[0])[0] + '.bil'
-    bil_path = os.path.join(bil_path, bil_name)
-    # Open the .bil file as an xarray dataset
+    filename = os.path.basename(file_url)
+    base_name = os.path.basename(filename)
+    file_name_without_extension = os.path.splitext(os.path.splitext(base_name)[0])[0] + '.bil'
+    bil_path = os.path.join(output_dir, file_name_without_extension)
+    if not os.path.exists(netcdf_dir):
+    # If not, create the directory
+       os.makedirs(netcdf_dir) 
+    #Open the .bil file as an xarray dataset
     with rioxarray.open_rasterio(bil_path) as xds:
         # Process or save the xarray dataset as needed
         # For example, you can save it as a NetCDF file
        ncname=date.strftime('%Y%m%d')
-       nc_path = os.path.join(netcdf_path, f"{ncname}.nc")
+       nc_path = os.path.join(netcdf_dir, f"{ncname}.nc")
        xds.to_netcdf(nc_path)
        print(f"Converted {bil_path} to {nc_path}")
     return 'xds'  # Return the xarray dataset
