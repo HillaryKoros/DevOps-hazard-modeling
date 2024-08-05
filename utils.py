@@ -14,6 +14,7 @@ import pandas as pd
 import requests
 import xarray as xr
 import rioxarray
+import xesmf as xe
 import rasterio
 from bs4 import BeautifulSoup
 import flox
@@ -22,7 +23,8 @@ import geopandas as gp
 from rasterio.features import rasterize
 from rasterio.transform import from_bounds
 
-
+from distributed import Client
+from dask.diagnostics import ProgressBar
 
 def gefs_chrips_list_tiff_files(base_url, date_string):
     '''
@@ -463,8 +465,8 @@ def pet_read_netcdf_files_in_date_range(folder_path, start_date, end_date):
         datasets.append(ds)
 
     combined_dataset = xr.concat(datasets, dim='time')
-    
-    return combined_dataset
+    combined_dataset1 = combined_dataset.rename(x='lon', y='lat') 
+    return combined_dataset1
 
 def pet_extend_forecast(df, date_column, days_to_add=18):
     """
@@ -526,6 +528,26 @@ def pet_extend_forecast(df, date_column, days_to_add=18):
 
 
 def make_zones_geotif(shapefl_name,km_str,zone_str):
+    """
+    Create a GeoTIFF from a shapefile representing a zone.
+
+    Parameters:
+    ----------
+    shapefl_name : str
+        Name of the shapefile for the zone.
+    km_str : int
+        Pixel size for the output raster in kilometers.
+    zone_str : str
+        Identifier for the zone, used in the naming of the output GeoTIFF.
+
+    Returns:
+    -------
+    output_tiff_path : str
+        The path to the generated GeoTIFF file.
+    Example:
+    -------
+    zone1_tif=make_zones_geotif(shapefl_name,km_str,zone_str)
+    """
     gdf=gp.read_file(shapefl_name)
     # Define the output raster properties
     pixel_size = km_str/100  # Define the pixel size (adjust as needed)
@@ -699,8 +721,68 @@ def regrid_dataset(input_ds, input_chunk_sizes, output_chunk_sizes, zone_extent,
     with ProgressBar():
         result = regridded.compute()
 
-    print("Regridding complete. Result shape:", result.shape)
     return result
+
+
+def process_zone_and_subset_data(shapefl_name, km_str, zone_str, pds):
+    """
+    Process a zone shapefile to create a GeoTIFF and subset a dataset based on the resulting GeoTIFF.
+
+    Parameters:
+    ----------
+    data_path : str
+        Path to the data directory containing the shapefile.
+    shapefl_name : str
+        Name of the shapefile for the zone.
+    km_str : int
+        Pixel size for the output raster in kilometers.
+    zone_str : str
+        Identifier for the zone, used in the naming of the output GeoTIFF.
+    pds : xarray.Dataset
+        The dataset from which a subset is to be extracted based on the zone extent.
+
+    Returns:
+    -------
+    z1ds : xarray.DataArray
+        The dataset corresponding to the generated GeoTIFF.
+    pz1ds : xarray.Dataset
+        The subset of the input dataset 'pds' within the extent of the zone.
+
+    Example:
+    -------
+    data_path = '/path/to/data/'
+    shapefl_name = f'{data_path}WGS/zone6.shp'
+    km_str = 1
+    zone_str = 'zone1'
+    pds = xr.open_dataset('example_dataset.nc')
+
+    z1ds, pz1ds, zone_extent = process_zone_and_subset_data(shapefl_name, km_str, zone_str, pds)
+    """
+
+    # Generate the output path for the zone GeoTIFF
+    zone1_tif = make_zones_geotif(shapefl_name, km_str, zone_str)
+
+    # Load and process the generated GeoTIFF
+    z1ds = rioxarray.open_rasterio(zone1_tif, chunks="auto").squeeze()
+    z1crds = z1ds.rename(x='lon', y='lat')
+    z1county_id = np.unique(z1crds.data).compute()
+    z1lat_max = z1crds['lat'].max().values
+    z1lat_min = z1crds['lat'].min().values
+    z1lon_max = z1crds['lon'].max().values
+    z1lon_min = z1crds['lon'].min().values
+
+    zone_extent = {
+        'lat_max': z1lat_max,
+        'lat_min': z1lat_min,
+        'lon_max': z1lon_max,
+        'lon_min': z1lon_min
+    }
+
+    # Subset the provided dataset based on the zone extent
+    pz1ds = pds.sel(lat=slice(z1lat_max, z1lat_min), lon=slice(z1lon_min, z1lon_max))
+
+    return z1crds, pz1ds, zone_extent
+
 
 
 
