@@ -21,6 +21,9 @@ from utils import pet_extend_forecast
 from utils import make_zones_geotif
 from utils import get_dask_client_params
 
+from utils import process_zone_and_subset_data
+from utils import regrid_dataset
+
 
 load_dotenv()
 
@@ -49,7 +52,14 @@ pds=pet_read_netcdf_files_in_date_range(netcdf_path, start_date, end_date)
 pds = pds.rename(x='lon', y='lat')
 
 
-params = get_dask_client_paramsclient = Client(**params)
+##############
+#zone 6
+shapefl_name=f'{input_path}WGS/zone6.shp'
+km_str=1
+zone_str='zone6'
+z1ds, pdsz1, zone_extent = process_zone_and_subset_data(shapefl_name, km_str, zone_str, pds)
+
+
 
 
 input_chunk_sizes = {'time': 10, 'lat': 30, 'lon': 30}
@@ -63,5 +73,4 @@ z1ds = regrid_dataset(
     zone_extent,
     regrid_method="bilinear"
 )
-
 
