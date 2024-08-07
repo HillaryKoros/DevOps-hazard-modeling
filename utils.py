@@ -658,6 +658,67 @@ def pet_extend_forecast(df, date_column, days_to_add=18):
     return df
 
 
+def process_zone_and_subset_data(zone_shapefl_name, km_str, zone_str, pds):
+    """
+    Process a zone shapefile to create a GeoTIFF and subset a dataset based on the resulting GeoTIFF.
+
+    Parameters:
+    ----------
+    data_path : str
+        Path to the data directory containing the shapefile.
+    shapefl_name : str
+        Name of the shapefile for the zone.
+    km_str : int
+        Pixel size for the output raster in kilometers.
+    zone_str : str
+        Identifier for the zone, used in the naming of the output GeoTIFF.
+    pds : xarray.Dataset
+        The dataset from which a subset is to be extracted based on the zone extent.
+
+    Returns:
+    -------
+    z1ds : xarray.DataArray
+        The dataset corresponding to the generated GeoTIFF.
+    pz1ds : xarray.Dataset
+        The subset of the input dataset 'pds' within the extent of the zone.
+
+    Example:
+    -------
+    data_path = '/path/to/data/'
+    shapefl_name = f'{data_path}WGS/zone6.shp'
+    km_str = 1
+    zone_str = 'zone1'
+    pds = xr.open_dataset('example_dataset.nc')
+
+    z1ds, pz1ds, zone_extent = process_zone_and_subset_data(shapefl_name, km_str, zone_str, pds)
+    """
+
+    # Generate the output path for the zone GeoTIFF
+    zone1_tif = make_zones_geotif(zone_shapefl_name, km_str, zone_str)
+
+    # Load and process the generated GeoTIFF
+    z1ds = rioxarray.open_rasterio(zone1_tif, chunks="auto").squeeze()
+    z1crds = z1ds.rename(x='lon', y='lat')
+    z1county_id = np.unique(z1crds.data).compute()
+    z1lat_max = z1crds['lat'].max().values
+    z1lat_min = z1crds['lat'].min().values
+    z1lon_max = z1crds['lon'].max().values
+    z1lon_min = z1crds['lon'].min().values
+
+    zone_extent = {
+        'lat_max': z1lat_max,
+        'lat_min': z1lat_min,
+        'lon_max': z1lon_max,
+        'lon_min': z1lon_min
+    }
+
+    # Subset the provided dataset based on the zone extent
+    pz1ds = pds.sel(lat=slice(z1lat_max, z1lat_min), lon=slice(z1lon_min, z1lon_max))
+
+    return z1crds, pz1ds, zone_extent
+
+
+
 def regrid_dataset(input_ds, input_chunk_sizes, output_chunk_sizes, zone_extent, regrid_method="bilinear"):
     """
     Regrid a dataset to a specified output grid using a specified regridding method.
@@ -723,66 +784,116 @@ def regrid_dataset(input_ds, input_chunk_sizes, output_chunk_sizes, zone_extent,
 
     return result
 
-
-def process_zone_and_subset_data(shapefl_name, km_str, zone_str, pds):
+   
+def zone_mean_df(input_ds, zone_ds):
     """
-    Process a zone shapefile to create a GeoTIFF and subset a dataset based on the resulting GeoTIFF.
+    Compute the mean of values in `input_ds` grouped by zones defined in `zone_ds` using the "split-apply-combine" strategy.
+    This method is particularly aligned with the 'flox groupby method' (see xarray.dev/blog/flox) designed to optimize 
+    such operations within xarray's framework. The method consists of three primary steps:
+        1. Split: The input dataset is aligned and then split according to the zones defined within `zone_ds`.
+        2. Apply: A mean reduction is applied to each group of data to summarize the values within each zone.
+        3. Combine: The results of the mean calculations are combined into a single DataFrame for further analysis or export.
 
     Parameters:
     ----------
-    data_path : str
-        Path to the data directory containing the shapefile.
-    shapefl_name : str
-        Name of the shapefile for the zone.
-    km_str : int
-        Pixel size for the output raster in kilometers.
-    zone_str : str
-        Identifier for the zone, used in the naming of the output GeoTIFF.
-    pds : xarray.Dataset
-        The dataset from which a subset is to be extracted based on the zone extent.
+    input_ds : xarray.Dataset
+        The input dataset containing the data to be averaged. This dataset should contain numerical data that can be
+        meaningfully averaged.
+    zone_ds : xarray.Dataset
+        A dataset derived from polygon zones, indicating the areas over which to calculate means. This dataset
+        typically originates from geographic or spatial delineations converted into a format compatible with xarray.
 
     Returns:
     -------
-    z1ds : xarray.DataArray
-        The dataset corresponding to the generated GeoTIFF.
-    pz1ds : xarray.Dataset
-        The subset of the input dataset 'pds' within the extent of the zone.
+    pandas.DataFrame
+        A DataFrame with the mean values for each zone, reset with a clean index to facilitate easy use in further
+        analysis or visualization.
 
     Example:
     -------
-    data_path = '/path/to/data/'
-    shapefl_name = f'{data_path}WGS/zone6.shp'
-    km_str = 1
-    zone_str = 'zone1'
-    pds = xr.open_dataset('example_dataset.nc')
+    # Assuming 'input_ds' is loaded with relevant environmental data and 'zone_ds' represents catchment areas
+    input_ds = xr.open_dataset('input_data.nc')
+    zone_ds = process_zone_and_subset_data('shapefile.shp', 1, 'zone1', input_ds)[1]
+    zone_mean_df = zone_mean_df(input_ds, zone_ds)
 
-    z1ds, pz1ds, zone_extent = process_zone_and_subset_data(shapefl_name, km_str, zone_str, pds)
+    Notes:
+    -------
+    The function aligns both datasets before grouping to ensure that the data corresponds directly to the defined zones,
+    potentially overriding the alignment of `input_ds` with that of `zone_ds` if discrepancies exist. This is crucial for
+    maintaining consistency in spatial analyses where precise location alignment is necessary.
     """
-
-    # Generate the output path for the zone GeoTIFF
-    zone1_tif = make_zones_geotif(shapefl_name, km_str, zone_str)
-
-    # Load and process the generated GeoTIFF
-    z1ds = rioxarray.open_rasterio(zone1_tif, chunks="auto").squeeze()
-    z1crds = z1ds.rename(x='lon', y='lat')
-    z1county_id = np.unique(z1crds.data).compute()
-    z1lat_max = z1crds['lat'].max().values
-    z1lat_min = z1crds['lat'].min().values
-    z1lon_max = z1crds['lon'].max().values
-    z1lon_min = z1crds['lon'].min().values
-
-    zone_extent = {
-        'lat_max': z1lat_max,
-        'lat_min': z1lat_min,
-        'lon_max': z1lon_max,
-        'lon_min': z1lon_min
-    }
-
-    # Subset the provided dataset based on the zone extent
-    pz1ds = pds.sel(lat=slice(z1lat_max, z1lat_min), lon=slice(z1lon_min, z1lon_max))
-
-    return z1crds, pz1ds, zone_extent
+    z1d_, aligned_zone_ds = xr.align(input_ds, zone_ds, join="override")
+    z1 = input_ds.groupby(aligned_zone_ds).mean()
+    z1 = z1.to_dataframe()
+    z1a = z1.reset_index()
+    return z1a
 
 
 
+def pet_update_input_data(z1a, zone_input_path, zone_str, start_date, end_date):
+    """
+    Processes evaporation data by performing a series of transformations and merging operations,
+    culminating in the extension of forecasts and exporting to a CSV file.
+
+    Parameters:
+    ----------
+    z1a : pandas.DataFrame
+        Dataframe containing PET data that needs to be adjusted, pivoted, and formatted.
+    zone_input_path : str
+        Base path for input and output data files related to specific zones.
+    zone_str : str
+        Identifier for the specific zone, used for file naming and directory structure.
+    start_date : datetime
+        Start date for filtering the dataset.
+    end_date : datetime
+        End date for filtering the dataset.
+
+    Returns:
+    -------
+    None
+        Outputs are written directly to a CSV file.
+
+    Example:
+    -------
+    process_evaporation_data(z1a, '/path/to/zone/data/', 'zone1', '2024-01-01', '2024-12-31')
+    """
+    # Adjust the 'pet' column by a factor of 10
+    z1a['pet'] = z1a['pet'] / 10
+    
+    # Pivot the DataFrame
+    zz1 = z1a.pivot(index='time', columns='group', values='pet')
+    
+    # Apply formatting to the pivoted DataFrame
+    zz1 = zz1.apply(lambda row: row.map(lambda x: f'{x:.1f}' if isinstance(x, (int, float)) and pd.notna(x) else x), axis=1)
+    
+    # Reset the index and adjust columns
+    azz1 = zz1.reset_index()
+    azz1['NA'] = azz1['time'].dt.strftime('%Y%j')
+    azz1.columns = [str(col) if isinstance(col, int) else col for col in azz1.columns]
+    azz1 = azz1.rename(columns={'time': 'date'})
+    
+    # Read evaporation data from text file
+    ez1 = pd.read_csv(f'{zone_input_path}{zone_str}/evap.txt', sep=",")
+    ez1['date'] = pd.to_datetime(ez1['NA'], format='%Y%j')
+    
+    # Create a mask for filtering data
+    mask = (ez1['date'] < start_date) | (ez1['date'] > end_date)
+    aez1 = ez1[mask]
+    
+    # Concatenate DataFrames
+    bz1 = pd.concat([aez1, azz1], axis=0)
+    
+    # Reset index and drop unnecessary columns
+    bz1.drop(['date'], axis=1, inplace=True)
+    bz1.reset_index(drop=True, inplace=True)
+    
+    # Extend the forecast data
+    bz2 = pet_extend_forecast(bz1, 'NA')
+    
+    # Output to a CSV file
+    end_date_str = end_date.strftime('%Y%j')  # Formats date as "YearDayOfYear", e.g., "2024365"
+    
+    # Output to a CSV file
+    output_filename = f'{zone_input_path}{zone_str}/evap_{end_date_str}.txt'
+    bz2.to_csv(output_filename)
 
