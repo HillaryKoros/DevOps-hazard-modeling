@@ -600,64 +600,6 @@ def get_dask_client_params():
     }
 
 
-def pet_extend_forecast(df, date_column, days_to_add=18):
-    """
-    Add a specified number of days to the last date in a DataFrame, 
-    repeating all values from the last row for non-date columns.
-    
-    Parameters:
-    df (pd.DataFrame): Input DataFrame
-    date_column (str): Name of the column containing dates in 'YYYYDDD' format
-    days_to_add (int): Number of days to add (default is 18)
-    
-    Returns:
-    pd.DataFrame: DataFrame with additional rows
-    """
-    
-    def safe_to_datetime(date_str):
-        try:
-            return datetime.strptime(str(date_str), '%Y%j')
-        except ValueError:
-            return None
-
-    # Create a copy of the input DataFrame to avoid modifying the original
-    df = df.copy()
-    
-    # Convert date column to datetime
-    df[date_column] = df[date_column].apply(safe_to_datetime)
-    
-    # Remove any rows where the date conversion failed
-    df = df.dropna(subset=[date_column])
-    
-    if not df.empty:
-        # Get the last row
-        last_row = df.iloc[-1]
-        
-        # Create a list of new dates
-        last_date = last_row[date_column]
-        new_dates = [last_date + timedelta(days=i+1) for i in range(days_to_add)]
-        
-        # Create new rows
-        new_rows = []
-        for new_date in new_dates:
-            new_row = last_row.copy()
-            new_row[date_column] = new_date
-            new_rows.append(new_row)
-        
-        # Convert new_rows to a DataFrame
-        new_rows_df = pd.DataFrame(new_rows)
-        
-        # Concatenate the new rows to the original DataFrame
-        df = pd.concat([df, new_rows_df], ignore_index=True)
-        
-        # Convert date column back to the original string format
-        df[date_column] = df[date_column].dt.strftime('%Y%j')
-    else:
-        print(f"No valid dates found in the '{date_column}' column.")
-    
-    return df
-
-
 def process_zone_and_subset_data(zone_shapefl_name, km_str, zone_str, pds):
     """
     Process a zone shapefile to create a GeoTIFF and subset a dataset based on the resulting GeoTIFF.
