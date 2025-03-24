@@ -162,8 +162,4 @@ The system calculates mean values for each variable within each zone, providing 
 
 ## License
 
-[Your License Information]
-
-## Contributors
-
-[Your Contributor Information]
+This project is licensed under the MIT License - see the LICENSE file for details.
