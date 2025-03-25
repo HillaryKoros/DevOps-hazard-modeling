@@ -50,3 +50,17 @@ hazard-env/
 *.swp
 *.swo
 *~
+
+
+#qgis project files
+*.qgs
+*.qgz
+*.qgd
+
+*.zip
+
+# Git files
+*.gitignore
+*.gitattributes
+
+/geofsm-prod-all-zones-20240712
