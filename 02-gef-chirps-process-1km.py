@@ -4,15 +4,17 @@ import os
 from datetime import datetime, timedelta
 import xarray as xr
 from dask.distributed import Client
+import geopandas as gp
 
 from utils import (
     gefs_chrips_list_tiff_files,
     gefs_chrips_download_files,
     gefs_chrips_process,
     get_dask_client_params,
-    process_zone_and_subset_data,
+    process_zone_from_combined,
     regrid_dataset,
-    zone_mean_df
+    zone_mean_df,
+    make_zones_geotif
 )
 
 load_dotenv()
@@ -35,9 +37,18 @@ def get_gefs_files(base_url, date_string):
 
 @task
 def download_gefs_files(url_list, date_string, download_dir):
-    """Download GEFS-CHIRPS files"""
-    gefs_chrips_download_files(url_list, date_string, download_dir)
-    return f"{download_dir}/{date_string}"
+    """Download GEFS-CHIRPS files if they don't already exist"""
+    # Create the directory path for the date
+    date_dir = f"{download_dir}/{date_string}"
+    
+    # Check if the directory exists and has files in it
+    if os.path.exists(date_dir) and os.listdir(date_dir):
+        print(f"Data for {date_string} already exists in {date_dir}, skipping download.")
+    else:
+        print(f"Downloading data for {date_string}...")
+        gefs_chrips_download_files(url_list, date_string, download_dir)
+    
+    return date_dir
 
 @task
 def process_gefs_data(input_path):
@@ -46,10 +57,11 @@ def process_gefs_data(input_path):
 
 @task
 def process_zone(data_path, pds, zone_str):
-    """Process zone shapefile and subset data"""
-    shapefl_name = f'{data_path}WGS/{zone_str}.shp'
+    """Process zone from combined shapefile and subset data"""
+    # Use the combined shapefile instead of individual zone files
+    master_shapefile = f'{data_path}WGS/geofsm-prod-all-zones-20240712.shp'  # Update with your actual filename
     km_str = 1
-    z1ds, pdsz1, zone_extent = process_zone_and_subset_data(shapefl_name, km_str, zone_str, pds)
+    z1ds, pdsz1, zone_extent = process_zone_from_combined(master_shapefile, zone_str, km_str, pds)
     return z1ds, pdsz1, zone_extent
 
 @task
@@ -122,21 +134,50 @@ def gefs_chirps_all_zones_workflow(date_string: str = None):
         base_url = "https://data.chc.ucsb.edu/products/EWX/data/forecasts/CHIRPS-GEFS_precip_v12/daily_16day/"
         url_list = get_gefs_files(base_url, date_string)
         
-        if not url_list:
-            print(f"No files found for date {date_string}")
-            client.close()
-            return None
-            
-        input_path = download_gefs_files(url_list, date_string, download_dir)
+        # Check if the data directory already exists
+        existing_dir = f"{download_dir}/{date_string}"
+        if os.path.exists(existing_dir) and os.listdir(existing_dir):
+            print(f"Data for {date_string} already exists in {existing_dir}, skipping API check and download.")
+            input_path = existing_dir
+        else:
+            # If no data found for the current date, try yesterday's date
+            if not url_list:
+                print(f"No files found for date {date_string}, trying yesterday's date...")
+                yesterday_date = (datetime.strptime(date_string, '%Y%m%d') - timedelta(days=1)).strftime('%Y%m%d')
+                
+                # Check if yesterday's data already exists
+                yesterday_dir = f"{download_dir}/{yesterday_date}"
+                if os.path.exists(yesterday_dir) and os.listdir(yesterday_dir):
+                    print(f"Data for yesterday ({yesterday_date}) already exists in {yesterday_dir}, using that.")
+                    date_string = yesterday_date
+                    input_path = yesterday_dir
+                else:
+                    # Try to fetch yesterday's data
+                    url_list = get_gefs_files(base_url, yesterday_date)
+                    
+                    if url_list:
+                        print(f"Found {len(url_list)} files for yesterday ({yesterday_date})")
+                        date_string = yesterday_date
+                        input_path = download_gefs_files(url_list, date_string, download_dir)
+                    else:
+                        print(f"No files found for yesterday ({yesterday_date}) either. Exiting.")
+                        client.close()
+                        return None
+            else:
+                input_path = download_gefs_files(url_list, date_string, download_dir)
         
         # Process GEFS-CHIRPS data (only once for all zones)
         print("Processing downloaded files...")
         pds = process_gefs_data(input_path)
         
+        # Get list of unique zone values from the shapefile
+        master_shapefile = f'{data_path}WGS/geofsm-prod-all-zones-20240712.shp'  # Update with your actual filename
+        all_zones = gp.read_file(master_shapefile)
+        unique_zones = all_zones['zone'].unique()
+        
         # Process each zone
         output_files = []
-        for zone_num in range(1, 7):  # Process zones 1 through 6
-            zone_str = f"zone{zone_num}"
+        for zone_str in unique_zones:  # Process all zones from the shapefile
             try:
                 output_file = process_single_zone(data_path, pds, zone_str, date_string)
                 output_files.append(output_file)
@@ -155,9 +196,8 @@ def gefs_chirps_all_zones_workflow(date_string: str = None):
         client.close()
 
 if __name__ == "__main__":
-    # Set the date directly in the code - this is yesterday's date
-    # You can modify this line directly when you need to process a different date
-    date_string = (datetime.now() - timedelta(days=1)).strftime('%Y%m%d')
+    # Set the date to today by default
+    date_string = datetime.now().strftime('%Y%m%d')
     
     print(f"Processing data for date: {date_string}")
     
