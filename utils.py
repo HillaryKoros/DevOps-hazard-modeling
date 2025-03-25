@@ -8,7 +8,6 @@ from urllib.parse import urljoin, urlparse
 import psutil
 import math
 
-
 import numpy as np
 import pandas as pd
 import requests
@@ -57,7 +56,7 @@ def gefs_chrips_list_tiff_files(base_url, date_string):
     return tiff_files
 
 
-def gefs_chrips_download_files(url_list, date_string,download_dir):
+def gefs_chrips_download_files(url_list, date_string, download_dir):
     '''
     url_list=tiff_files
     download_dir=f'{data_path}geofsm-input/gefs-chrips'
@@ -527,7 +526,7 @@ def pet_extend_forecast(df, date_column, days_to_add=18):
     return df
 
 
-def make_zones_geotif(shapefl_name,km_str,zone_str):
+def make_zones_geotif(shapefl_name, km_str, zone_str):
     """
     Create a GeoTIFF from a shapefile representing a zone.
 
@@ -548,7 +547,7 @@ def make_zones_geotif(shapefl_name,km_str,zone_str):
     -------
     zone1_tif=make_zones_geotif(shapefl_name,km_str,zone_str)
     """
-    gdf=gp.read_file(shapefl_name)
+    gdf = gp.read_file(shapefl_name)
     # Define the output raster properties
     pixel_size = km_str/100  # Define the pixel size (adjust as needed)
     minx, miny, maxx, maxy = gdf.total_bounds
@@ -581,62 +580,49 @@ def make_zones_geotif(shapefl_name,km_str,zone_str):
     return output_tiff_path
 
 
-
-def get_dask_client_params():
-    # Get number of CPU cores (leave 1 for the OS)
-    n_workers = max(1, psutil.cpu_count(logical=False) - 1)
-    
-    # Assuming hyperthreading is available
-    threads_per_worker = 2
-    
-    # Calculate available memory per worker (in GB)
-    total_memory = psutil.virtual_memory().total / (1024**3)  # Convert to GB
-    memory_per_worker = math.floor(total_memory / n_workers * 0.75)  # Use 75% of available memory
-    
-    return {
-        "n_workers": n_workers,
-        "threads_per_worker": threads_per_worker,
-        "memory_limit": f"{memory_per_worker}GB"
-    }
-
-
-def process_zone_and_subset_data(zone_shapefl_name, km_str, zone_str, pds):
+def process_zone_from_combined(master_shapefile, zone_name, km_str, pds):
     """
-    Process a zone shapefile to create a GeoTIFF and subset a dataset based on the resulting GeoTIFF.
-
+    Process a specific zone from a combined shapefile and subset data based on that zone.
+    
     Parameters:
     ----------
-    data_path : str
-        Path to the data directory containing the shapefile.
-    shapefl_name : str
-        Name of the shapefile for the zone.
+    master_shapefile : str
+        Path to the shapefile containing all zones.
+    zone_name : str
+        Name of the zone to extract (e.g., 'zone1').
     km_str : int
         Pixel size for the output raster in kilometers.
-    zone_str : str
-        Identifier for the zone, used in the naming of the output GeoTIFF.
     pds : xarray.Dataset
         The dataset from which a subset is to be extracted based on the zone extent.
-
+        
     Returns:
     -------
-    z1ds : xarray.DataArray
-        The dataset corresponding to the generated GeoTIFF.
+    z1crds : xarray.DataArray
+        The dataset corresponding to the generated GeoTIFF for the specific zone.
     pz1ds : xarray.Dataset
         The subset of the input dataset 'pds' within the extent of the zone.
-
-    Example:
-    -------
-    data_path = '/path/to/data/'
-    shapefl_name = f'{data_path}WGS/zone6.shp'
-    km_str = 1
-    zone_str = 'zone1'
-    pds = xr.open_dataset('example_dataset.nc')
-
-    z1ds, pz1ds, zone_extent = process_zone_and_subset_data(shapefl_name, km_str, zone_str, pds)
+    zone_extent : dict
+        Dictionary containing the latitude and longitude extents of the zone.
     """
-
+    # Read the master shapefile
+    all_zones = gp.read_file(master_shapefile)
+    
+    # Filter for the specific zone
+    zone_gdf = all_zones[all_zones['zone'] == zone_name].copy()
+    
+    if zone_gdf.empty:
+        raise ValueError(f"Zone '{zone_name}' not found in the shapefile.")
+    
+    # Create a temporary directory for the zone-specific shapefile if it doesn't exist
+    temp_dir = os.path.join(os.path.dirname(master_shapefile), "temp")
+    os.makedirs(temp_dir, exist_ok=True)
+    
+    # Save the filtered zone as a temporary shapefile
+    temp_shapefile = os.path.join(temp_dir, f"{zone_name}.shp")
+    zone_gdf.to_file(temp_shapefile)
+    
     # Generate the output path for the zone GeoTIFF
-    zone1_tif = make_zones_geotif(zone_shapefl_name, km_str, zone_str)
+    zone1_tif = make_zones_geotif(temp_shapefile, km_str, zone_name)
 
     # Load and process the generated GeoTIFF
     z1ds = rioxarray.open_rasterio(zone1_tif, chunks="auto").squeeze()
@@ -659,6 +645,23 @@ def process_zone_and_subset_data(zone_shapefl_name, km_str, zone_str, pds):
 
     return z1crds, pz1ds, zone_extent
 
+
+def get_dask_client_params():
+    # Get number of CPU cores (leave 1 for the OS)
+    n_workers = max(1, psutil.cpu_count(logical=False) - 1)
+    
+    # Assuming hyperthreading is available
+    threads_per_worker = 2
+    
+    # Calculate available memory per worker (in GB)
+    total_memory = psutil.virtual_memory().total / (1024**3)  # Convert to GB
+    memory_per_worker = math.floor(total_memory / n_workers * 0.75)  # Use 75% of available memory
+    
+    return {
+        "n_workers": n_workers,
+        "threads_per_worker": threads_per_worker,
+        "memory_limit": f"{memory_per_worker}GB"
+    }
 
 
 def regrid_dataset(input_ds, input_chunk_sizes, output_chunk_sizes, zone_extent, regrid_method="bilinear"):
@@ -838,4 +841,3 @@ def pet_update_input_data(z1a, zone_input_path, zone_str, start_date, end_date):
     # Output to a CSV file
     output_filename = f'{zone_input_path}{zone_str}/evap_{end_date_str}.txt'
     bz2.to_csv(output_filename)
-
