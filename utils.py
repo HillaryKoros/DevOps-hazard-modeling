@@ -25,6 +25,10 @@ from rasterio.transform import from_bounds
 from distributed import Client
 from dask.diagnostics import ProgressBar
 
+###############################################################################
+# GEFS-CHIRPS Processing Functions
+###############################################################################
+
 def gefs_chrips_list_tiff_files(base_url, date_string):
     '''
     base_url = "https://data.chc.ucsb.edu/products/EWX/data/forecasts/CHIRPS-GEFS_precip_v12/daily_16day/"
@@ -137,6 +141,10 @@ def gefs_chrips_process(input_path):
     ds = ds.sortby('time')
     ds1 = ds.to_dataset(name='rain')
     return ds1
+
+###############################################################################
+# IMERG Processing Functions
+###############################################################################
 
 def imerg_list_files_by_date(url, flt_str, username, password, start_date, end_date):
     """
@@ -271,6 +279,9 @@ def imerg_read_tiffs_to_dataset(folder_path, start_date, end_date):
     
     return combined_ds
 
+###############################################################################
+# PET Processing Functions
+###############################################################################
 
 def pet_list_files_by_date(url, start_date, end_date):
     '''
@@ -525,6 +536,9 @@ def pet_extend_forecast(df, date_column, days_to_add=18):
     
     return df
 
+###############################################################################
+# Zone Processing Functions
+###############################################################################
 
 def make_zones_geotif(shapefl_name, km_str, zone_str):
     """
@@ -645,6 +659,9 @@ def process_zone_from_combined(master_shapefile, zone_name, km_str, pds):
 
     return z1crds, pz1ds, zone_extent
 
+###############################################################################
+# Dask and Regridding Functions
+###############################################################################
 
 def get_dask_client_params():
     # Get number of CPU cores (leave 1 for the OS)
@@ -729,7 +746,10 @@ def regrid_dataset(input_ds, input_chunk_sizes, output_chunk_sizes, zone_extent,
 
     return result
 
-   
+###############################################################################
+# Data Aggregation and Output Functions
+###############################################################################
+
 def zone_mean_df(input_ds, zone_ds):
     """
     Compute the mean of values in `input_ds` grouped by zones defined in `zone_ds` using the "split-apply-combine" strategy.
