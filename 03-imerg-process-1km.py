@@ -217,15 +217,13 @@ def process_single_zone(data_path, imerg_ds, zone_str, date_string, copy_to_zone
     return txt_file
 
 @flow
-def imerg_all_zones_workflow(start_date: str = yesterday, end_date: str = ""):
+def imerg_all_zones_workflow(start_date: str = None, end_date: str = None, copy_to_zone_wise: bool = False):
     """Process IMERG data for all zones"""
-    copy_to_zone_wise = False
-    
-    # Handle default values for start_date and end_date
-    if not start_date:
+    if start_date is None:
+        # Default to yesterday 
         start_date = yesterday
     
-    if not end_date:
+    if end_date is None:
         # Default to same as start_date if not specified
         end_date = start_date
     
@@ -271,7 +269,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Process IMERG data for hydrological modeling')
     parser.add_argument('--start-date', type=str, default=yesterday, 
                         help=f'Start date in YYYYMMDD format (default: {yesterday})')
-    parser.add_argument('--end-date', type=str, default="", 
+    parser.add_argument('--end-date', type=str, default=None, 
                         help='End date in YYYYMMDD format (default: same as start-date)')
     parser.add_argument('--copy-to-zone-wise', action='store_true', 
                         help='Copy output files to zone_wise_txt_files directory')
@@ -279,5 +277,5 @@ if __name__ == "__main__":
     args = parser.parse_args()
     
     print(f"Processing IMERG data from {args.start_date} to {args.end_date or args.start_date}")
-    result = imerg_all_zones_workflow(args.start_date, args.end_date)
+    result = imerg_all_zones_workflow(args.start_date, args.end_date, args.copy_to_zone_wise)
     print(f"Generated files: {result['txt_files']}")
