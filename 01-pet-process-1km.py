@@ -3,13 +3,11 @@ from dotenv import load_dotenv
 import os
 from datetime import datetime, timedelta
 import xarray as xr
-import numpy as np
 from dask.distributed import Client
-import logging
-import sys
-import pandas as pd
-import glob
 import geopandas as gp
+import pandas as pd
+import numpy as np
+import glob
 
 from utils import (
     pet_list_files_by_date,
@@ -23,28 +21,22 @@ from utils import (
     pet_update_input_data
 )
 
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.StreamHandler(sys.stdout)
-    ]
-)
-logger = logging.getLogger('pet_workflow')
-
-# Load environment variables
 load_dotenv()
 
-@task(name="setup_environment", retries=2, retry_delay_seconds=5)
+# Default to yesterday if date is not provided
+yesterday = (datetime.now() - timedelta(days=1)).strftime('%Y%m%d')
+
+@task
+def get_current_date():
+    """Get the current date in YYYYMMDD format."""
+    return datetime.now().strftime('%Y%m%d')
+
+@task
 def setup_environment():
     """Set up the environment for data processing"""
-    input_path = os.getenv("data_path")
-    if not input_path:
-        input_path = "./"  # Default to current directory if not set
-    
-    output_dir = f'{input_path}PET/dir/'
-    netcdf_path = f'{input_path}PET/netcdf/'
+    data_path = os.getenv("data_path", "./data/")  # Default to ./data/ if not set
+    output_dir = f'{data_path}geofsm-input/pet/dir/'
+    netcdf_path = f'{data_path}geofsm-input/pet/netcdf/'
     
     os.makedirs(output_dir, exist_ok=True)
     os.makedirs(netcdf_path, exist_ok=True)
@@ -52,117 +44,100 @@ def setup_environment():
     params = get_dask_client_params()
     client = Client(**params)
     
-    logger.info(f"Environment setup complete. Using data_path: {input_path}")
-    return input_path, output_dir, netcdf_path, client
+    print(f"Environment setup complete. Using data_path: {data_path}")
+    return data_path, output_dir, netcdf_path, client
 
-@task(name="check_pet_data_availability")
-def check_pet_data_availability(url, date_to_check, output_dir, netcdf_path):
+@task
+def get_most_recent_pet_files(url):
     """
-    Check if PET data is available for the specified date,
-    if not fall back to previous dates
+    Get today's or yesterday's PET file from the server listing.
     
     Args:
-        url (str): URL for PET data
-        date_to_check (datetime): Date to check for data availability 
-        output_dir (str): Directory to store PET files
-        netcdf_path (str): Directory to store NetCDF files
+        url (str): URL for PET data directory
         
     Returns:
-        tuple: (start_date, end_date) for data processing
+        tuple: (file_url, file_date) for the most recent file (today or yesterday)
     """
-    logger.info(f"Checking PET data availability for {date_to_check.strftime('%Y-%m-%d')}")
+    import requests
+    from bs4 import BeautifulSoup
+    from urllib.parse import urljoin
     
-    # Ensure date_to_check is not in the future
-    current_date = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
-    if date_to_check > current_date:
-        logger.warning(f"Requested date {date_to_check.strftime('%Y-%m-%d')} is in the future")
-        date_to_check = current_date
-        logger.info(f"Using current date instead: {date_to_check.strftime('%Y-%m-%d')}")
+    print(f"Looking for today's or yesterday's PET file from {url}")
     
-    # Maximum number of days to check backward
-    max_days_to_check = 10
-    
-    # List to store dates to check in order of preference
-    dates_to_check = []
-    
-    # Start with the requested date
-    dates_to_check.append(date_to_check)
-    
-    # Add previous days
-    for i in range(1, max_days_to_check + 1):
-        dates_to_check.append(date_to_check - timedelta(days=i))
-    
-    # Check each date
-    for check_date in dates_to_check:
-        date_str = check_date.strftime('%Y%m%d')
-        logger.info(f"Checking data availability for {date_str}")
-        
-        # Check if we already have the netCDF file locally
-        nc_file = os.path.join(netcdf_path, f"{date_str}.nc")
-        if os.path.exists(nc_file):
-            logger.info(f"Found local data for {date_str}")
-            return check_date - timedelta(days=30), check_date
-        
-        # Check if the data is available online
-        try:
-            date_pet_list = pet_list_files_by_date(url, check_date, check_date)
-            
-            if date_pet_list:
-                logger.info(f"Found online data for {date_str}")
-                # Download and process the data
-                for file_url, file_date in date_pet_list:
-                    try:
-                        pet_download_extract_bilfile(file_url, output_dir)
-                        pet_bil_netcdf(file_url, file_date, output_dir, netcdf_path)
-                    except Exception as e:
-                        logger.error(f"Error processing file {file_url}: {e}")
-                        continue
-                
-                return check_date - timedelta(days=30), check_date
-            else:
-                logger.warning(f"No data available for {date_str}")
-        except Exception as e:
-            logger.error(f"Error checking data for {date_str}: {e}")
-    
-    # If we've checked all dates and found nothing, 
-    # try to use the most recent available netCDF file
     try:
-        nc_files = glob.glob(os.path.join(netcdf_path, "*.nc"))
-        if nc_files:
-            # Extract dates from filenames
-            dates = [os.path.basename(f).replace('.nc', '') for f in nc_files]
-            # Parse dates and find the most recent
-            parsed_dates = [datetime.strptime(d, '%Y%m%d') for d in dates]
-            most_recent = max(parsed_dates)
-            
-            logger.info(f"Using most recent available data from {most_recent.strftime('%Y%m%d')}")
-            start_date = most_recent - timedelta(days=30)
-            return start_date, most_recent
-    except Exception as e:
-        logger.error(f"Error finding most recent data: {e}")
+        response = requests.get(url)
+        response.raise_for_status()
+        soup = BeautifulSoup(response.text, 'html.parser')
+        
+        # Find all tar.gz file links
+        pet_files = []
+        for link in soup.find_all('a'):
+            href = link.get('href')
+            if href and href.endswith('.tar.gz') and href.startswith('et'):
+                # Extract date info from link text or from timestamp
+                file_url = urljoin(url, href)
+                
+                # Try to get date from the filename (et240409.tar.gz -> 2024-04-09)
+                try:
+                    # Extract date part (et240409 -> 240409)
+                    date_part = href.replace('et', '').split('.')[0]
+                    year = int('20' + date_part[:2])
+                    month = int(date_part[2:4])
+                    day = int(date_part[4:6])
+                    file_date = datetime(year, month, day)
+                    
+                    pet_files.append((file_url, file_date, href))
+                except Exception as e:
+                    print(f"Could not parse date from {href}: {e}")
+        
+        # Sort by date, most recent first
+        pet_files.sort(key=lambda x: x[1], reverse=True)
+        
+        # Get today's and yesterday's dates
+        today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+        yesterday = today - timedelta(days=1)
+        
+        # Find today's file
+        for url, date, filename in pet_files:
+            if date.date() == today.date():
+                print(f"Found today's file: {filename} ({date.strftime('%Y-%m-%d')})")
+                return url, date
+        
+        # If today's file not found, find yesterday's file
+        for url, date, filename in pet_files:
+            if date.date() == yesterday.date():
+                print(f"Today's file not found. Using yesterday's file: {filename} ({date.strftime('%Y-%m-%d')})")
+                return url, date
+        
+        # If neither found, use the most recent file
+        if pet_files:
+            url, date, filename = pet_files[0]
+            print(f"Neither today's nor yesterday's file found. Using most recent: {filename} ({date.strftime('%Y-%m-%d')})")
+            return url, date
+        else:
+            print("No PET files found on server")
+            return None, None
     
-    # If all else fails, use a fallback date range
-    fallback_end = current_date - timedelta(days=1)  # yesterday
-    fallback_start = fallback_end - timedelta(days=30)
-    logger.warning(f"No recent data found. Using fallback date range {fallback_start.strftime('%Y-%m-%d')} to {fallback_end.strftime('%Y-%m-%d')}")
-    return fallback_start, fallback_end
+    except Exception as e:
+        print(f"Error fetching PET files: {e}")
+        return None, None
 
-@task(name="get_pet_files", retries=2, retry_delay_seconds=60)
+@task
 def get_pet_files(url, start_date, end_date):
     """Get the list of PET files for the date range"""
     try:
-        logger.info(f"Getting PET files from {start_date.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')}")
+        print(f"Getting PET files from {start_date.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')}")
         pet_list = pet_list_files_by_date(url, start_date, end_date)
-        logger.info(f"Found {len(pet_list)} PET files in date range")
+        print(f"Found {len(pet_list)} PET files in date range")
         return pet_list
     except Exception as e:
-        logger.error(f"Error fetching PET files: {e}")
+        print(f"Error fetching PET files: {e}")
         raise
 
-@task(name="process_pet_files", retries=1)
+@task
 def process_pet_files(pet_list, output_dir, netcdf_path):
     """Download and process PET files"""
-    logger.info(f"Processing {len(pet_list)} PET files")
+    print(f"Processing {len(pet_list)} PET files")
     processed_files = 0
     
     for file_url, date in pet_list:
@@ -171,95 +146,150 @@ def process_pet_files(pet_list, output_dir, netcdf_path):
             nc_file = os.path.join(netcdf_path, f"{date_str}.nc")
             
             if os.path.exists(nc_file):
-                logger.info(f"NetCDF file already exists for {date_str}, skipping download and conversion")
+                print(f"NetCDF file already exists for {date_str}, skipping download and conversion")
                 processed_files += 1
                 continue
             
-            logger.info(f"Processing PET file for {date_str}")
+            print(f"Processing PET file for {date_str}")
             pet_download_extract_bilfile(file_url, output_dir)
             pet_bil_netcdf(file_url, date, output_dir, netcdf_path)
             processed_files += 1
         except Exception as e:
-            logger.error(f"Error processing PET file {file_url}: {e}")
+            print(f"Error processing PET file {file_url}: {e}")
     
-    logger.info(f"Processed {processed_files} PET files")
+    print(f"Processed {processed_files} PET files")
     return processed_files
 
-@task(name="read_pet_data")
+@task
 def read_pet_data(netcdf_path, start_date, end_date):
     """Read PET data from NetCDF files"""
     try:
-        logger.info(f"Reading PET data from {start_date.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')}")
-        pds = pet_read_netcdf_files_in_date_range(netcdf_path, start_date, end_date)
+        print(f"Reading PET data from {start_date.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')}")
         
-        logger.info(f"Dataset dimensions: {list(pds.dims.keys())}")
+        # Handle the case where no files exist for the date range
+        nc_files = []
+        date_range = pd.date_range(start=start_date, end=end_date)
         
+        for date in date_range:
+            date_str = date.strftime('%Y%m%d')
+            nc_file = os.path.join(netcdf_path, f"{date_str}.nc")
+            if os.path.exists(nc_file):
+                nc_files.append(nc_file)
+        
+        if not nc_files:
+            print(f"No NetCDF files found in the date range {start_date.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')}")
+            print("Using the most recent file and repeating it for the entire date range")
+            
+            # Find the most recent file available
+            all_nc_files = glob.glob(os.path.join(netcdf_path, "*.nc"))
+            if not all_nc_files:
+                raise FileNotFoundError("No NetCDF files found in the directory")
+            
+            dates = [datetime.strptime(os.path.basename(f).replace('.nc', ''), '%Y%m%d') for f in all_nc_files]
+            most_recent_idx = dates.index(max(dates))
+            most_recent_file = all_nc_files[most_recent_idx]
+            
+            # Use this file for all dates in the range
+            nc_files = [most_recent_file] * len(date_range)
+            print(f"Using {most_recent_file} for all dates")
+        
+        # Read and combine the files
+        datasets = []
+        for i, (file, date) in enumerate(zip(nc_files, date_range)):
+            if i == 0:
+                print(f"Reading first file: {file}")
+            
+            # Open the file
+            ds = xr.open_dataset(file)
+            
+            # Remove spatial_ref if it exists
+            if 'spatial_ref' in ds.variables:
+                ds = ds.drop_vars('spatial_ref')
+                
+            # Rename variables if needed
+            if 'band' in ds.variables:
+                ds = ds.drop_vars('band')
+                
+            if 'date' in ds.variables:
+                ds = ds.drop_vars('date')
+                
+            # Squeeze dimensions if needed
+            if 'band' in ds.dims:
+                ds = ds.squeeze('band')
+                
+            # Rename the data variable if needed
+            if '__xarray_dataarray_variable__' in ds.data_vars:
+                ds = ds.rename_vars({'__xarray_dataarray_variable__': 'pet'})
+                
+            # Set the date
+            ds = ds.expand_dims(time=[date])
+            datasets.append(ds)
+            
+            if i == 0:
+                print(f"First dataset dims: {ds.dims}, coords: {list(ds.coords)}, data_vars: {list(ds.data_vars)}")
+        
+        # Combine all datasets
+        print(f"Combining {len(datasets)} datasets")
+        combined_dataset = xr.concat(datasets, dim='time')
+        
+        # Rename coordinates to ensure compatibility
         rename_dict = {}
-        if 'x' in pds.dims:
+        if 'x' in combined_dataset.dims and 'lon' not in combined_dataset.dims:
             rename_dict['x'] = 'lon'
-        if 'y' in pds.dims:
+        if 'y' in combined_dataset.dims and 'lat' not in combined_dataset.dims:
             rename_dict['y'] = 'lat'
             
-        if not rename_dict and 'lon' not in pds.dims:
-            for dim in pds.dims:
-                if dim.lower() in ['longitude', 'long', 'x_dim']:
-                    rename_dict[dim] = 'lon'
-                elif dim.lower() in ['latitude', 'lat', 'y_dim']:
-                    rename_dict[dim] = 'lat'
-        
         if rename_dict:
-            logger.info(f"Renaming dimensions: {rename_dict}")
-            pds_renamed = pds.rename(rename_dict)
-        else:
-            logger.info("No dimensions need renaming")
-            pds_renamed = pds
+            print(f"Renaming dimensions: {rename_dict}")
+            combined_dataset = combined_dataset.rename(rename_dict)
         
-        logger.info(f"Successfully read PET data with shape {pds_renamed.dims}")
-        return pds_renamed
+        print(f"Successfully read PET data with shape {combined_dataset.dims}")
+        return combined_dataset
     except Exception as e:
-        logger.error(f"Error reading PET data: {e}")
-        if 'pds' in locals():
-            logger.error(f"Dataset info - dims: {pds.dims}, coords: {list(pds.coords)}, data_vars: {list(pds.data_vars)}")
+        print(f"Error reading PET data: {e}")
         raise
 
-@task(name="process_zone", retries=1)
-def process_zone(input_path, pds, zone_str):
+@task
+def process_zone(data_path, pds, zone_str):
     """Process zone from combined shapefile and subset data"""
-    master_shapefile = f'{input_path}data/WGS/geofsm-prod-all-zones-20240712.shp'
+    master_shapefile = f'{data_path}WGS/geofsm-prod-all-zones-20240712.shp'
     
     if not os.path.exists(master_shapefile):
-        logger.error(f"Master shapefile not found: {master_shapefile}")
+        print(f"Master shapefile not found: {master_shapefile}")
         raise FileNotFoundError(f"Master shapefile not found: {master_shapefile}")
     
+    # Standardize zone string format
+    if not isinstance(zone_str, str):
+        zone_str = str(zone_str)
+        
     if zone_str.isdigit():
         zone_str = f'zone{zone_str}'
-    elif zone_str.startswith('zone '):
-        zone_str = zone_str.replace('zone ', 'zone')
     elif not zone_str.startswith('zone'):
         zone_str = f'zone{zone_str}'
-    zone_str = zone_str.replace('zonezone', 'zone')
     
-    logger.info(f"Processing {zone_str} from combined shapefile")
-    
-    all_zones = gp.read_file(master_shapefile)
-    if zone_str not in all_zones['zone'].values:
-        logger.error(f"Zone '{zone_str}' not found in shapefile {master_shapefile}")
-        raise ValueError(f"Zone '{zone_str}' not found in the shapefile.")
+    print(f"Processing {zone_str} from combined shapefile")
+    km_str = 1  # 1km resolution
     
     try:
-        z1ds, pdsz1, zone_extent = process_zone_from_combined(master_shapefile, zone_str, 1, pds)
+        z1ds, pdsz1, zone_extent = process_zone_from_combined(master_shapefile, zone_str, km_str, pds)
+        print(f"Processed zone {zone_str}")
         return z1ds, pdsz1, zone_extent
     except Exception as e:
-        logger.error(f"Error processing zone {zone_str}: {e}")
+        print(f"Error processing zone {zone_str}: {e}")
         raise
 
-@task(name="regrid_pet_data")
-def regrid_pet_data(pdsz1, input_chunk_sizes, output_chunk_sizes, zone_extent):
+@task
+def regrid_pet_data(pdsz1, zone_extent):
     """Regrid PET data to match zone resolution"""
-    logger.info("Regridding PET data")
+    print("Regridding PET data")
     try:
+        input_chunk_sizes = {'time': 10, 'lat': 30, 'lon': 30}
+        output_chunk_sizes = {'lat': 300, 'lon': 300}
+        
+        # Ensure data is contiguous
         for var in pdsz1.data_vars:
             pdsz1[var] = pdsz1[var].copy(data=np.ascontiguousarray(pdsz1[var].data))
+            
         return regrid_dataset(
             pdsz1,
             input_chunk_sizes,
@@ -268,157 +298,215 @@ def regrid_pet_data(pdsz1, input_chunk_sizes, output_chunk_sizes, zone_extent):
             regrid_method="bilinear"
         )
     except Exception as e:
-        logger.error(f"Error regridding PET data: {e}")
+        print(f"Error regridding PET data: {e}")
         raise
 
-@task(name="calculate_zone_means")
+@task
 def calculate_zone_means(regridded_data, zone_ds):
     """Calculate mean PET values for each zone"""
-    logger.info("Calculating zone means")
+    print("Calculating zone means")
     try:
         return zone_mean_df(regridded_data, zone_ds)
     except Exception as e:
-        logger.error(f"Error calculating zone means: {e}")
+        print(f"Error calculating zone means: {e}")
         raise
 
-@task(name="save_pet_results")
-def save_pet_results(results_df, input_path, zone_str, end_date):
+@task
+def save_pet_results(results_df, data_path, zone_str, end_date):
     """Save processed PET results and update input data"""
     try:
-        zone_input_path = f"{input_path}zone_wise_txt_files/"
+        # Create output directories
+        output_dir = f"{data_path}geofsm-input/processed/{zone_str}"
+        zone_input_path = f"{data_path}zone_wise_txt_files/"
+        
+        os.makedirs(output_dir, exist_ok=True)
         os.makedirs(f"{zone_input_path}{zone_str}", exist_ok=True)
         
+        # Format dates
         start_date = pd.to_datetime(results_df['time'].min())
         end_date_obj = pd.to_datetime(results_df['time'].max())
         
-        # Update filename to include zone number (e.g., evap_zoneXX.txt)
-        evap_filename = f"evap_{zone_str}.txt"
-        logger.info(f"Updating PET input data for zone {zone_str}")
-        pet_update_input_data(results_df, zone_input_path, zone_str, start_date, end_date_obj)
-        
-        output_dir = f"{input_path}PET/processed/{zone_str}"
-        os.makedirs(output_dir, exist_ok=True)
-        
-        # Ensure end_date is in the right format for the filename
         if isinstance(end_date, datetime):
             end_date_str = end_date.strftime('%Y%m%d')
         else:
             end_date_str = end_date
-        
+            
+        # Save CSV file
         csv_file = f"{output_dir}/pet_{end_date_str}.csv"
         results_df.to_csv(csv_file, index=False)
+        print(f"CSV results saved to {csv_file}")
         
-        logger.info(f"Results saved to {zone_input_path}{zone_str}/{evap_filename} and {csv_file}")
-        return f"{zone_input_path}{zone_str}/{evap_filename}"
+        # Update PET input data
+        pet_update_input_data(results_df, zone_input_path, zone_str, start_date, end_date_obj)
+        evap_file = f"{zone_input_path}{zone_str}/evap_{end_date_obj.strftime('%Y%j')}.txt"
+        print(f"PET input data updated: {evap_file}")
+        
+        return evap_file
     except Exception as e:
-        logger.error(f"Error saving PET results: {e}")
+        print(f"Error saving PET results: {e}")
         raise
 
-@task(name="check_previously_processed")
-def check_previously_processed(input_path, zone_str):
-    """Check if PET data for a zone has already been processed"""
-    zone_input_path = f"{input_path}zone_wise_txt_files/"
-    evap_file = f"{zone_input_path}{zone_str}/evap.txt"
+@task
+def copy_to_zone_wise_txt(data_path, zone_str, txt_file):
+    """Copy the text file to the zone-wise directory"""
+    zone_wise_dir = f"{data_path}zone_wise_txt_files/{zone_str}"
+    os.makedirs(zone_wise_dir, exist_ok=True)
     
-    if os.path.exists(evap_file):
-        logger.info(f"PET data for zone {zone_str} already processed")
-        return True, evap_file
-    
-    logger.info(f"No previously processed PET data found for zone {zone_str}")
-    return False, None
-
-@flow(name="process_single_zone_pet")
-def process_single_zone_pet(input_path, pds, zone_str, end_date, force_reprocess=False):
-    """Process PET data for a single zone"""
-    logger.info(f"Processing PET data for zone {zone_str}")
-    
-    already_processed, existing_file = check_previously_processed(input_path, zone_str)
-    if already_processed and not force_reprocess:
-        logger.info(f"Using existing processed data for zone {zone_str}")
-        return existing_file
+    # Update filename to include zone number
+    dst_file = f"{zone_wise_dir}/pet_{zone_str}.txt"
     
     try:
-        z1ds, pdsz1, zone_extent = process_zone(input_path, pds, zone_str)
-        input_chunk_sizes = {'time': 10, 'lat': 30, 'lon': 30}
-        output_chunk_sizes = {'lat': 300, 'lon': 300}
-        regridded_data = regrid_pet_data(pdsz1, input_chunk_sizes, output_chunk_sizes, zone_extent)
-        zone_means = calculate_zone_means(regridded_data, z1ds)
-        result_file = save_pet_results(zone_means, input_path, zone_str, end_date)
-        return result_file
+        with open(txt_file, 'r') as src_f:
+            content = src_f.read()
+        with open(dst_file, 'w') as dst_f:
+            dst_f.write(content)
+        print(f"Copied {txt_file} to {dst_file}")
+        return dst_file
     except Exception as e:
-        logger.error(f"Error processing zone {zone_str}: {e}")
+        print(f"Error copying to zone-wise file: {e}")
         return None
 
-@flow(name="process_pet_data")
-def process_pet_data(zone_str="6", force_reprocess=False, check_date=None):
+@flow
+def process_single_zone_pet(data_path, pds, zone_str, date_string, copy_to_zone_wise=False):
+    """Process PET data for a single zone"""
+    print(f"Processing zone {zone_str}...")
+    
+    # Check if data for this zone and date has already been processed
+    output_dir = f"{data_path}geofsm-input/processed/{zone_str}"
+    os.makedirs(output_dir, exist_ok=True)
+    
+    z1ds, pdsz1, zone_extent = process_zone(data_path, pds, zone_str)
+    regridded_data = regrid_pet_data(pdsz1, zone_extent)
+    zone_means = calculate_zone_means(regridded_data, z1ds)
+    txt_file = save_pet_results(zone_means, data_path, zone_str, date_string)
+    
+    if copy_to_zone_wise and txt_file:
+        copy_to_zone_wise_txt(data_path, zone_str, txt_file)
+    
+    return txt_file
+
+@flow
+def pet_all_zones_workflow(copy_to_zone_wise: bool = False):
     """
-    Main flow to process PET data
+    Main workflow for processing PET data for all zones.
     
     Args:
-        zone_str (str): Zone identifier (e.g., "6" or "zone6")
-        force_reprocess (bool): Force reprocessing even if data exists
-        check_date (str or datetime): Date to check for data availability (default: today)
+        copy_to_zone_wise: Whether to copy the results to zone-wise txt files
+        
+    Returns:
+        Dict containing the paths to the generated txt files
     """
-    # Set up environment
-    input_path, output_dir, netcdf_path, client = setup_environment()
-    
-    # Base URL for PET data
-    url = "https://edcintl.cr.usgs.gov/downloads/sciweb1/shared/fews/web/global/daily/pet/downloads/daily/"
+    data_path, output_dir, netcdf_path, client = setup_environment()
     
     try:
-        # Handle the check date parameter
-        if check_date is None:
-            # Use current date by default
-            check_date = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
-        elif isinstance(check_date, str):
-            # Parse date string in multiple formats
-            for fmt in ['%Y%m%d', '%Y-%m-%d', '%d/%m/%Y']:
-                try:
-                    check_date = datetime.strptime(check_date, fmt)
-                    break
-                except ValueError:
-                    continue
-            if isinstance(check_date, str):
-                raise ValueError(f"Could not parse check_date: {check_date}")
+        # Base URL for PET data
+        url = "https://edcintl.cr.usgs.gov/downloads/sciweb1/shared/fews/web/global/daily/pet/downloads/daily/"
         
-        # Check data availability
-        start_date, end_date = check_pet_data_availability(url, check_date, output_dir, netcdf_path)
-        
-        # Get PET files for the date range
-        pet_list = get_pet_files(url, start_date, end_date)
-        
-        # Process PET files
-        process_pet_files(pet_list, output_dir, netcdf_path)
-        
-        # Read processed data
-        pds = read_pet_data(netcdf_path, start_date, end_date)
-        
-        # Process the specified zone
-        result = process_single_zone_pet(input_path, pds, zone_str, end_date, force_reprocess)
-        
-        if result:
-            logger.info(f"PET workflow completed successfully for {zone_str}")
-            return result
+        # Check if master shapefile exists before continuing
+        master_shapefile = f'{data_path}WGS/geofsm-prod-all-zones-20240712.shp'
+        if not os.path.exists(master_shapefile):
+            print(f"ERROR: Master shapefile not found at {master_shapefile}")
+            print(f"Current working directory: {os.getcwd()}")
+            print(f"Available files in {os.path.dirname(master_shapefile) or '.'}:")
+            if os.path.exists(os.path.dirname(master_shapefile) or '.'):
+                print(os.listdir(os.path.dirname(master_shapefile) or '.'))
+            else:
+                print(f"Directory {os.path.dirname(master_shapefile)} does not exist")
+            raise FileNotFoundError(f"Master shapefile not found: {master_shapefile}")
         else:
-            logger.warning(f"PET workflow for {zone_str} returned no results")
-            return None
+            print(f"Found master shapefile: {master_shapefile}")
         
+        # Get today's or yesterday's PET file directly from the server
+        most_recent_url, most_recent_date = get_most_recent_pet_files(url)
+        
+        if not most_recent_url or not most_recent_date:
+            print("No suitable PET file found on server. Cannot proceed.")
+            return {'txt_files': []}
+        
+        # Process the file
+        print(f"Processing PET file from {most_recent_date.strftime('%Y-%m-%d')}")
+        pet_download_extract_bilfile(most_recent_url, output_dir)
+        pet_bil_netcdf(most_recent_url, most_recent_date, output_dir, netcdf_path)
+        
+        # Set date range to just the single day of the file
+        date_string = most_recent_date.strftime('%Y%m%d')
+        
+        # Read processed data for just that day
+        print(f"Reading PET data for {most_recent_date.strftime('%Y-%m-%d')}")
+        nc_file = os.path.join(netcdf_path, f"{date_string}.nc")
+        
+        if not os.path.exists(nc_file):
+            print(f"ERROR: NetCDF file not found at {nc_file}")
+            return {'txt_files': []}
+        
+        # Open the dataset
+        ds = xr.open_dataset(nc_file)
+        
+        # Process the dataset
+        if 'spatial_ref' in ds.variables:
+            ds = ds.drop_vars('spatial_ref')
+        
+        if 'band' in ds.variables:
+            ds = ds.drop_vars('band')
+        
+        if 'date' in ds.variables:
+            ds = ds.drop_vars('date')
+        
+        if 'band' in ds.dims:
+            ds = ds.squeeze('band')
+        
+        if '__xarray_dataarray_variable__' in ds.data_vars:
+            ds = ds.rename_vars({'__xarray_dataarray_variable__': 'pet'})
+        
+        # Add time dimension
+        ds = ds.expand_dims(time=[most_recent_date])
+        
+        # Rename coordinates if needed
+        rename_dict = {}
+        if 'x' in ds.dims and 'lon' not in ds.dims:
+            rename_dict['x'] = 'lon'
+        if 'y' in ds.dims and 'lat' not in ds.dims:
+            rename_dict['y'] = 'lat'
+        
+        if rename_dict:
+            print(f"Renaming dimensions: {rename_dict}")
+            ds = ds.rename(rename_dict)
+        
+        print(f"Dataset ready with dimensions: {ds.dims}")
+        
+        # Process all zones
+        all_zones = gp.read_file(master_shapefile)
+        unique_zones = all_zones['zone'].unique()
+        output_files = []
+        
+        for zone_str in unique_zones:
+            try:
+                txt_file = process_single_zone_pet(data_path, ds, zone_str, date_string, copy_to_zone_wise)
+                if txt_file:
+                    output_files.append(txt_file)
+            except Exception as e:
+                print(f"Error processing {zone_str}: {e}")
+        
+        print(f"Workflow completed successfully! Processed {len(output_files)} zones")
+        return {'txt_files': output_files}
+    
     except Exception as e:
-        logger.error(f"Error in PET workflow: {e}")
+        print(f"Error in workflow: {e}")
         raise
     finally:
-        # Clean up client
-        if 'client' in locals():
-            client.close()
+        client.close()
+        
 
 if __name__ == "__main__":
-    # Parse command line arguments
+    
     import argparse
-    parser = argparse.ArgumentParser(description='Process PET data for a specific zone')
-    parser.add_argument('--zone', type=str, default="6", help='Zone identifier (e.g., "6" or "zone6")')
-    parser.add_argument('--force', action='store_true', help='Force reprocessing even if data exists')
-    parser.add_argument('--date', type=str, help='Date to check for data availability (format: YYYYMMDD)')
+    
+    parser = argparse.ArgumentParser(description='Process PET data for hydrological modeling')
+    parser.add_argument('--copy-to-zone-wise', action='store_true', 
+                        help='Copy output files to zone_wise_txt_files directory')
+    
     args = parser.parse_args()
     
-    # Run the flow
-    process_pet_data(zone_str=args.zone, force_reprocess=args.force, check_date=args.date)
+    print(f"Processing most recent PET data")
+    result = pet_all_zones_workflow(args.copy_to_zone_wise)
+    print(f"Generated files: {result['txt_files']}")

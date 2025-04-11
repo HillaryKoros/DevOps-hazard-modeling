@@ -794,7 +794,6 @@ def zone_mean_df(input_ds, zone_ds):
     return z1a
 
 
-
 def pet_update_input_data(z1a, zone_input_path, zone_str, start_date, end_date):
     """
     Processes evaporation data by performing a series of transformations and merging operations,
@@ -815,13 +814,18 @@ def pet_update_input_data(z1a, zone_input_path, zone_str, start_date, end_date):
 
     Returns:
     -------
-    None
-        Outputs are written directly to a CSV file.
-
-    Example:
-    -------
-    process_evaporation_data(z1a, '/path/to/zone/data/', 'zone1', '2024-01-01', '2024-12-31')
+    str
+        Path to the output file in the processed directory.
     """
+    # Ensure zone_wise directory exists
+    zone_dir = f'{zone_input_path}{zone_str}'
+    os.makedirs(zone_dir, exist_ok=True)
+    
+    # Get base path for processed directory
+    base_path = zone_input_path.replace('zone_wise_txt_files/', '')
+    processed_dir = f'{base_path}geofsm-input/processed/{zone_str}'
+    os.makedirs(processed_dir, exist_ok=True)
+    
     # Adjust the 'pet' column by a factor of 10
     z1a['pet'] = z1a['pet'] / 10
     
@@ -837,27 +841,63 @@ def pet_update_input_data(z1a, zone_input_path, zone_str, start_date, end_date):
     azz1.columns = [str(col) if isinstance(col, int) else col for col in azz1.columns]
     azz1 = azz1.rename(columns={'time': 'date'})
     
-    # Read evaporation data from text file
-    ez1 = pd.read_csv(f'{zone_input_path}{zone_str}/evap.txt', sep=",")
-    ez1['date'] = pd.to_datetime(ez1['NA'], format='%Y%j')
+    # Path to standard evap.txt file in zone_wise directory
+    evap_file = f'{zone_dir}/evap.txt'
     
-    # Create a mask for filtering data
-    mask = (ez1['date'] < start_date) | (ez1['date'] > end_date)
-    aez1 = ez1[mask]
-    
-    # Concatenate DataFrames
-    bz1 = pd.concat([aez1, azz1], axis=0)
-    
-    # Reset index and drop unnecessary columns
-    bz1.drop(['date'], axis=1, inplace=True)
-    bz1.reset_index(drop=True, inplace=True)
+    # Check if the evap.txt file exists
+    if os.path.exists(evap_file):
+        # If file exists, read and merge with new data
+        try:
+            ez1 = pd.read_csv(evap_file, sep=",")
+            ez1['date'] = pd.to_datetime(ez1['NA'], format='%Y%j')
+            
+            # Create a mask for filtering data
+            mask = (ez1['date'] < start_date) | (ez1['date'] > end_date)
+            aez1 = ez1[mask]
+            
+            # Concatenate DataFrames
+            bz1 = pd.concat([aez1, azz1], axis=0)
+            
+            # Reset index and drop unnecessary columns
+            bz1.drop(['date'], axis=1, inplace=True)
+            bz1.reset_index(drop=True, inplace=True)
+        except Exception as e:
+            print(f"Error reading existing evap.txt: {e}")
+            print("Creating new evap.txt file instead")
+            bz1 = azz1.drop(['date'], axis=1).reset_index(drop=True)
+    else:
+        # If file doesn't exist, just use the new data
+        print(f"No existing evap.txt found at {evap_file}. Creating new file.")
+        bz1 = azz1.drop(['date'], axis=1).reset_index(drop=True)
     
     # Extend the forecast data
     bz2 = pet_extend_forecast(bz1, 'NA')
     
-    # Output to a CSV file
-    end_date_str = end_date.strftime('%Y%j')  # Formats date as "YearDayOfYear", e.g., "2024365"
+    # Format date for filename
+    end_date_str = end_date.strftime('%Y%j')  # Formats as "YearDayOfYear", e.g., "2024365"
     
-    # Output to a CSV file
-    output_filename = f'{zone_input_path}{zone_str}/evap_{end_date_str}.txt'
-    bz2.to_csv(output_filename)
+    # 1. Create files in zone_wise_txt_files directory
+    
+    # Standard evap.txt file
+    bz2.to_csv(evap_file, index=False)
+    print(f"Created/updated standard evap.txt file: {evap_file}")
+    
+    # Zone-specific evap file (evap_zone1.txt)
+    zone_specific_file = f'{zone_dir}/evap_{zone_str}.txt'
+    bz2.to_csv(zone_specific_file, index=False)
+    print(f"Created zone-specific evap file: {zone_specific_file}")
+    
+    # Dated evap file (evap_2024365.txt)
+    dated_file = f'{zone_dir}/evap_{end_date_str}.txt'
+    bz2.to_csv(dated_file, index=False)
+    print(f"Created dated evap file: {dated_file}")
+    
+    # 2. Create files in geofsm-input/processed directory
+    
+    # Dated evap file in processed directory (evap_2024365.txt)
+    processed_dated_file = f'{processed_dir}/evap_{end_date_str}.txt'
+    bz2.to_csv(processed_dated_file, index=False)
+    print(f"Created dated evap file in processed directory: {processed_dated_file}")
+    
+    # Return the path to the processed file (to be consistent with GEFS-CHIRPS)
+    return processed_dated_file

@@ -7,6 +7,9 @@ from dask.distributed import Client
 import geopandas as gp
 import pandas as pd
 import glob
+import requests
+from bs4 import BeautifulSoup
+from urllib.parse import urljoin
 
 from utils import (
     gefs_chrips_list_tiff_files,
@@ -21,7 +24,101 @@ from utils import (
 
 load_dotenv()
 
-date_string = '20250407'  # Hardcoded date in YYYYMMDD format
+@task
+def get_current_date():
+    """Get the current date in YYYYMMDD format."""
+    return datetime.now().strftime('%Y%m%d')
+
+@task
+def check_data_availability(base_url, date_string):
+    """
+    Check if GEFS-CHIRPS data is available for the specified date.
+    
+    Args:
+        base_url: Base URL for the GEFS-CHIRPS data
+        date_string: Date in YYYYMMDD format
+        
+    Returns:
+        bool: True if data is available, False otherwise
+    """
+    try:
+        # Parse the date string
+        year = date_string[:4]
+        month = date_string[4:6]
+        day = date_string[6:]
+        
+        # Construct the URL for the specific date
+        url = f"{base_url}{year}/{month}/{day}/"
+        
+        # Send a request to check if the URL exists
+        response = requests.get(url)
+        
+        # Check if the request was successful
+        if response.status_code == 200:
+            # Parse the content to check if there are TIFF files available
+            soup = BeautifulSoup(response.text, 'html.parser')
+            tiff_files = [link.get('href') for link in soup.find_all('a') if link.get('href', '').endswith('.tif')]
+            
+            # If there are TIFF files, data is available
+            return len(tiff_files) > 0
+        
+        return False
+    except Exception as e:
+        print(f"Error checking data availability for {date_string}: {e}")
+        return False
+
+@task
+def get_best_available_date(base_url, days_to_check=7):  # Increase from 1 to 7 days
+    """
+    Get the most recent date for which data is available.
+    Start with today and go back up to 'days_to_check' days.
+    
+    Args:
+        base_url: Base URL for the GEFS-CHIRPS data
+        days_to_check: Number of days to check backward
+        
+    Returns:
+        str: Date in YYYYMMDD format, or None if no data is available
+    """
+    today = datetime.now()
+    
+    for i in range(days_to_check):
+        check_date = today - timedelta(days=i)
+        date_string = check_date.strftime('%Y%m%d')
+        print(f"Checking data availability for {date_string}...")
+        
+        if check_data_availability(base_url, date_string):
+            print(f"Data found for {date_string}")
+            return date_string
+    
+    print(f"No data found for the last {days_to_check} days")
+    return None
+
+@task
+def is_already_processed(data_path, zone_str, date_string):
+    """
+    Check if the data for a specific date has already been processed for a zone.
+    
+    Args:
+        data_path: Base data path
+        zone_str: Zone identifier
+        date_string: Date in YYYYMMDD format
+        
+    Returns:
+        bool: True if already processed, False otherwise
+    """
+    # Convert YYYYMMDD to YYYYDDD format
+    try:
+        date_obj = datetime.strptime(date_string, '%Y%m%d')
+        date_ddd = date_obj.strftime('%Y%j')
+    except ValueError:
+        date_ddd = date_string
+    
+    # Check for the existence of the processed file
+    output_dir = f"{data_path}geofsm-input/processed/{zone_str}"
+    processed_file = f"{output_dir}/rain_{date_ddd}.txt"
+    
+    return os.path.exists(processed_file)
 
 @task
 def setup_environment():
@@ -156,6 +253,17 @@ def copy_to_zone_wise_txt(data_path, zone_str, txt_file):
 @flow
 def process_single_zone(data_path, pds, zone_str, date_string, copy_to_zone_wise=False):
     print(f"Processing zone {zone_str}...")
+    
+    # Check if data for this zone and date has already been processed
+    date_obj = datetime.strptime(date_string, '%Y%m%d')
+    date_ddd = date_obj.strftime('%Y%j')
+    output_dir = f"{data_path}geofsm-input/processed/{zone_str}"
+    processed_file = f"{output_dir}/rain_{date_ddd}.txt"
+    
+    if os.path.exists(processed_file):
+        print(f"Data for zone {zone_str} and date {date_string} already processed. Skipping.")
+        return processed_file
+    
     z1ds, pdsz1, zone_extent = process_zone(data_path, pds, zone_str)
     input_chunk_sizes = {'time': 10, 'lat': 30, 'lon': 30}
     output_chunk_sizes = {'lat': 300, 'lon': 300}
@@ -168,23 +276,64 @@ def process_single_zone(data_path, pds, zone_str, date_string, copy_to_zone_wise
     return txt_file
 
 @flow
-def gefs_chirps_all_zones_workflow(date_string: str = date_string, copy_to_zone_wise: bool = False):
+def gefs_chirps_all_zones_workflow(date_string: str = None, copy_to_zone_wise: bool = False):
+    """
+    Main workflow for processing GEFS-CHIRPS data for all zones.
+    
+    Args:
+        date_string: Optional date in YYYYMMDD format. If None, the best available date will be determined.
+        copy_to_zone_wise: Whether to copy the results to zone-wise txt files
+        
+    Returns:
+        Dict containing the paths to the generated txt files
+    """
     data_path, download_dir, client = setup_environment()
+    
     try:
         base_url = "https://data.chc.ucsb.edu/products/EWX/data/forecasts/CHIRPS-GEFS_precip_v12/daily_16day/"
+        
+        # If date is not provided, find the most recent available date
+        if date_string is None:
+            date_string = get_best_available_date(base_url)
+            if date_string is None:
+                print("No data available for processing. Exiting workflow.")
+                return {'txt_files': []}
+        
+        # Check if yesterday's data was already processed
+        yesterday = (datetime.now() - timedelta(days=1)).strftime('%Y%m%d')
+        yesterday_dir = f"{download_dir}/{yesterday}"
+        
+        # If we're processing yesterday's data and it's already downloaded, check if it was processed
+        if date_string == yesterday and os.path.exists(yesterday_dir) and os.listdir(yesterday_dir):
+            # Check if data was already processed for at least one zone
+            master_shapefile = f'{data_path}WGS/geofsm-prod-all-zones-20240712.shp'
+            all_zones = gp.read_file(master_shapefile)
+            sample_zone = str(all_zones['zone'].iloc[0])
+            
+            if is_already_processed(data_path, sample_zone, yesterday):
+                print(f"Data for {yesterday} was already processed. Skipping workflow.")
+                return {'txt_files': []}
+        
+        # Get the list of files for the selected date
         url_list = get_gefs_files(base_url, date_string)
+        
+        # Check if data is already downloaded
         existing_dir = f"{download_dir}/{date_string}"
         if os.path.exists(existing_dir) and os.listdir(existing_dir):
-            print(f"Data for {date_string} already exists in {existing_dir}, skipping API check and download.")
+            print(f"Data for {date_string} already exists in {existing_dir}, skipping download.")
             input_path = existing_dir
         else:
             input_path = download_gefs_files(url_list, date_string, download_dir)
+        
         print("Processing downloaded files...")
         pds = process_gefs_data(input_path)
+        
+        # Process all zones
         master_shapefile = f'{data_path}WGS/geofsm-prod-all-zones-20240712.shp'
         all_zones = gp.read_file(master_shapefile)
         unique_zones = all_zones['zone'].unique()
         output_files = []
+        
         for zone_str in unique_zones:
             try:
                 txt_file = process_single_zone(data_path, pds, zone_str, date_string, copy_to_zone_wise)
@@ -192,8 +341,10 @@ def gefs_chirps_all_zones_workflow(date_string: str = date_string, copy_to_zone_
                     output_files.append(txt_file)
             except Exception as e:
                 print(f"Error processing {zone_str}: {e}")
+        
         print(f"Workflow completed successfully! Processed {len(output_files)} zones")
         return {'txt_files': output_files}
+    
     except Exception as e:
         print(f"Error in workflow: {e}")
         raise
@@ -201,7 +352,6 @@ def gefs_chirps_all_zones_workflow(date_string: str = date_string, copy_to_zone_
         client.close()
 
 if __name__ == "__main__":
-    print(f"Processing data for date: {date_string}")
-    # Set copy_to_zone_wise=True to copy rain.txt to zone_wise_txt_files
-    result = gefs_chirps_all_zones_workflow(date_string, copy_to_zone_wise=True)
+    # Let the workflow automatically determine the best available date
+    result = gefs_chirps_all_zones_workflow(copy_to_zone_wise=True)
     print(f"Generated files: {result['txt_files']}")
