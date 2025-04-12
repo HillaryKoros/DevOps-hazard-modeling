@@ -1,0 +1,15 @@
+numpy
+pandas
+geopandas
+xarray
+rioxarray
+netCDF4
+scipy
+shapely
+rasterio
+matplotlib
+fiona
+pyproj
+dask
+bottleneck
+prefect==2.14

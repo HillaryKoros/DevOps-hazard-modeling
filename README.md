@@ -1,165 +1,128 @@
-# IGAD-ICPAC DevOps Hazard Modeling
+# Hazard Modeling DevOps Setup
 
-This repository contains tools and workflows for processing, analyzing, and modeling meteorological and hydrological hazard data for the IGAD-ICPAC region in East Africa.
+This repository contains the configuration for running hazard modeling scripts as a containerized application on Kubernetes, managed by ArgoCD, and deployed locally using Minikube.
 
-## Overview
-
-The system processes several types of meteorological data at 1km resolution:
-- Potential Evapotranspiration (PET) data
-- GEFS-CHIRPS precipitation forecast data
-- IMERG precipitation data
-
-These scripts prepare data for a hydrological model and perform spatial analysis across six geographic zones in the region.
-
-## Repository Structure
+## Project Structure
 
 ```
 .
-├── 01-pet-process-1km.py         # Workflow for processing PET data
-├── 02-gef-chirps-process-1km.py  # Workflow for processing GEFS-CHIRPS data
-├── 03-imerg-process-1km.py       # Workflow for processing IMERG data (planned)
-├── data/
-│   ├── geofsm-input/             # Input and output folders for GeoFSM model
-│   │   ├── gefs-chirps/          # Storage for GEFS-CHIRPS data
-│   │   ├── imerg/                # Storage for IMERG data
-│   │   └── processed/            # Processed output by zone
-│   ├── PET/                      # PET data storage
-│   │   ├── dir/                  # Original BIL files
-│   │   └── netcdf/               # Converted NetCDF files
-│   └── WGS/                      # Geographic zone definitions
-├── utils.py                      # Utility functions used by all scripts
-└── README.md                     # This documentation file
+├── 01-pet-process-1km.py           # Python processing script
+├── 02-gef-chirps-process-1km.py    # Python processing script
+├── 03-imerg-process-1km.py         # Python processing script
+├── data                            # Data directory
+│   ├── geofsm-input                # Input data
+│   ├── PET                         # PET data
+│   ├── WGS                         # Shapefile data
+│   └── zone_wise_txt_files         # Zone text files
+├── utils.py                        # Utility functions
+├── Dockerfile                      # Docker image definition
+├── requirements.txt                # Python dependencies
+├── k8s                             # Kubernetes manifests
+│   ├── deployment.yaml             # CronJob definition
+│   ├── namespace.yaml              # Namespace definition
+│   ├── pvc.yaml                    # Persistent Volume Claims
+│   └── kustomization.yaml          # Kustomize configuration
+├── argocd                          # ArgoCD configuration
+│   └── application.yaml            # ArgoCD Application
+└── deploy-local.sh                 # Deployment script
 ```
 
-## Dependencies
+## Prerequisites
 
-This project requires the following Python libraries:
-- prefect (for workflow orchestration)
-- xarray, rioxarray (for array data handling)
-- dask (for parallel processing)
-- pandas (for tabular data)
-- numpy (for numerical operations)
-- rasterio (for raster data processing)
-- geopandas (for vector data processing)
-- xesmf (for regridding)
-- flox (for optimized groupby operations)
-- requests, BeautifulSoup (for web scraping and downloading)
-- psutil (for system resource management)
+- Docker
+- Minikube
+- kubectl
+- Git
 
-## Data Sources
+## Setup Instructions
 
-The system processes data from several sources:
+1. Clone this repository:
+   ```bash
+   git clone <repository-url>
+   cd <repository-directory>
+   ```
 
-1. **PET (Potential Evapotranspiration)**
-   - Source: USGS FEWS NET
-   - URL: https://edcintl.cr.usgs.gov/downloads/sciweb1/shared/fews/web/global/daily/pet/downloads/daily/
+2. Make the deployment script executable:
+   ```bash
+   chmod +x deploy-local.sh
+   ```
 
-2. **GEFS-CHIRPS (Global Ensemble Forecast System and Climate Hazards Group InfraRed Precipitation with Station data)**
-   - Source: Climate Hazards Center, UCSB
-   - URL: https://data.chc.ucsb.edu/products/EWX/data/forecasts/CHIRPS-GEFS_precip_v12/daily_16day/
+3. Run the deployment script:
+   ```bash
+   ./deploy-local.sh
+   ```
+   This will:
+   - Start Minikube if it's not running
+   - Build the Docker image
+   - Configure Kubernetes manifests
+   - Apply the manifests to create necessary resources
+   - Install ArgoCD if it's not already installed
+   - Create the ArgoCD application
+   - Trigger an initial job run
 
-3. **IMERG (Integrated Multi-satellitE Retrievals for GPM)**
-   - Source: NASA
-   - URL: https://jsimpsonhttps.pps.eosdis.nasa.gov/imerg/gis/early/
-   - Note: Requires authentication
+4. Access ArgoCD UI:
+   The script will output the URL, username, and password for ArgoCD.
 
-## Scripts
+## Configuration
 
-### 1. PET Processing (01-pet-process-1km.py)
+### CronJob Schedule
 
-This workflow downloads, processes, and regridds Potential Evapotranspiration (PET) data for hydrological modeling.
+The hazard modeling job is configured to run daily at midnight. You can modify the schedule in `k8s/deployment.yaml`:
 
-Key steps:
-- Download PET data in BIL format from USGS FEWS NET
-- Convert BIL files to NetCDF format
-- Process zone shapefiles to define analysis regions
-- Regrid PET data to match zone extents at 1km resolution
+```yaml
+spec:
+  schedule: "0 0 * * *"  # Cron schedule (current: daily at midnight)
+```
 
-Usage:
+### Resource Requirements
+
+You can adjust the CPU and memory requirements in the `k8s/deployment.yaml` file:
+
+```yaml
+resources:
+  requests:
+    memory: "2Gi"
+    cpu: "500m"
+  limits:
+    memory: "4Gi"
+    cpu: "1000m"
+```
+
+### Storage
+
+The application uses two Persistent Volume Claims:
+- `hazard-data-pvc`: For input data (10Gi)
+- `hazard-output-pvc`: For output data (5Gi)
+
+You can adjust the storage sizes in `k8s/pvc.yaml`.
+
+## Manual Job Execution
+
+To manually trigger the job:
+
 ```bash
-python 01-pet-process-1km.py
+kubectl create job --from=cronjob/hazard-modeling hazard-modeling-manual -n hazard-modeling
 ```
 
-### 2. GEFS-CHIRPS Processing (02-gef-chirps-process-1km.py)
+## Viewing Logs
 
-This workflow downloads, processes, and analyzes GEFS-CHIRPS precipitation forecast data for all six zones.
+To check logs from the most recent job:
 
-Key steps:
-- Download GEFS-CHIRPS data for a specified date
-- Process data into xarray format
-- For each zone (1-6):
-  - Process zone shapefile and subset data
-  - Regrid data to 1km resolution
-  - Calculate zonal statistics
-  - Save results as CSV files
-
-Usage:
 ```bash
-python 02-gef-chirps-process-1km.py
+kubectl get pods -n hazard-modeling
+kubectl logs <pod-name> -n hazard-modeling
 ```
 
-The script is configured to process yesterday's date by default. To process a different date, modify the date_string variable in the main block.
+## Scaling to Production
 
-### 3. IMERG Processing (03-imerg-process-1km.py) - Planned
+For production use:
 
-This workflow will download and process IMERG precipitation data.
-
-Key steps:
-- Download IMERG data for specified date range (requires authentication)
-- Process data into xarray format
-- Process each zone and perform spatial analysis
-- Calculate zonal statistics and save results
-
-## Setup and Configuration
-
-1. Clone the repository:
-```bash
-git clone https://github.com/username/IGAD-ICPAC-DevOps-hazard-modeling.git
-cd IGAD-ICPAC-DevOps-hazard-modeling
-```
-
-2. Create a `.env` file with the following variables:
-```
-data_path=/path/to/your/data/
-imerg_username=your_imerg_username
-imerg_password=your_imerg_password
-```
-
-3. Install dependencies:
-```bash
-pip install -r requirements.txt
-```
-
-## Workflow Execution
-
-The scripts use [Prefect](https://www.prefect.io/) for workflow orchestration, which provides:
-- Task dependency management
-- Parallel execution with Dask
-- Logging and monitoring
-- Failure handling and retries
-
-Each workflow is designed to be run independently, processing data for all six geographic zones.
-
-## Data Processing Details
-
-### Geographic Zones
-
-The system processes data for six geographic zones in East Africa. Each zone is defined by a shapefile in the WGS directory. The zones are processed into rasterized GeoTIFFs at 1km resolution.
-
-### Regridding
-
-Data is regridded to match the 1km resolution of the zone boundaries using bilinear interpolation through xESMF.
-
-### Zonal Statistics
-
-The system calculates mean values for each variable within each zone, providing summary statistics for hydrological modeling.
-
-## Notes for Developers
-
-- Dask client parameters are automatically optimized based on available system resources
-- For large datasets, adjust the chunking parameters in the regridding functions
-- When adding new data sources, follow the pattern of the existing modules in utils.py
-
+1. Use a container registry like Docker Hub, GitHub Container Registry, or a private registry
+2. Set up a CI/CD pipeline to build and push images automatically
+3. Configure proper secrets management for sensitive data
+4. Use dedicated persistent storage solutions
+5. Consider implementing monitoring and alerting
+6. Set up proper backup and disaster recovery procedures
 ## License
 
 This project is licensed under the MIT License - see the LICENSE file for details.
