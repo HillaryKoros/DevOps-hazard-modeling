@@ -22,9 +22,8 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt \
     && pip install --no-cache-dir prefect==2.14.5
 
-# Copy application code and data
+# Copy application code
 COPY *.py ./
-COPY utils.py ./
 
 # Create data directory structure
 RUN mkdir -p /app/data/geofsm-input/gefs-chirps \
@@ -38,8 +37,10 @@ RUN mkdir -p /app/data/geofsm-input/gefs-chirps \
     /app/data/zone_wise_txt_files \
     /app/zone_wise_txt_files
 
-# Copy WGS data if it exists
-COPY data/WGS* /app/data/WGS/ 2>/dev/null || true
+# Try to copy data files if they exist (with fallback if not found)
+# Removed wildcards to prevent build errors
+COPY data/WGS /app/data/WGS/ 2>/dev/null || true
+COPY zone_wise_txt_files /app/zone_wise_txt_files/ 2>/dev/null || true
 
 # Create an entrypoint script that will run all the processes
 RUN echo '#!/bin/bash\n\
