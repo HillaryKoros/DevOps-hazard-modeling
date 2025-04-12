@@ -1,0 +1,48 @@
+# Git
+.git
+.gitignore
+
+# GitHub
+.github
+
+# CI
+.travis.yml
+.circleci
+.github
+
+# Docker
+.dockerignore
+Dockerfile*
+docker-compose*
+
+# Documentation
+README*
+CHANGELOG*
+CONTRIBUTING*
+LICENSE*
+SETUP-CHECKLIST.md
+PRODUCTION-SETUP.md
+
+# Large data files
+# (Uncomment if needed)
+# data/WGS/*.zip
+# data/zone_wise_txt_files_only_gefs-chirps.zip
+# zone_txt_files.zip
+
+# ArgoCD
+argocd/
+
+# Kubernetes
+k8s/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+ENV/
+env/
+.env
+.venv
