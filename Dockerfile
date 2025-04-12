@@ -37,10 +37,8 @@ RUN mkdir -p /app/data/geofsm-input/gefs-chirps \
     /app/data/zone_wise_txt_files \
     /app/zone_wise_txt_files
 
-# Try to copy data files if they exist (with fallback if not found)
-# Removed wildcards to prevent build errors
-COPY data/WGS /app/data/WGS/ 2>/dev/null || true
-COPY zone_wise_txt_files /app/zone_wise_txt_files/ 2>/dev/null || true
+# Note: We're skipping copying the large data directories in this build
+# These will be mounted as volumes in the actual deployment
 
 # Create an entrypoint script that will run all the processes
 RUN echo '#!/bin/bash\n\

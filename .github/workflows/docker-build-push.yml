@@ -15,25 +15,15 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v3
 
-      # Debugging steps
-      - name: Debug - List repository contents
+      # Create necessary placeholder files for the build
+      - name: Create placeholder files
         run: |
-          ls -la
-          find . -type d | sort
-
-      # Create necessary directories and placeholder files
-      - name: Create necessary directories and files
-        run: |
-          mkdir -p zone_wise_txt_files
-          mkdir -p data/WGS
-          mkdir -p data/zone_wise_txt_files
+          mkdir -p data
           touch requirements.txt
           echo "# Placeholder for utils.py" > utils.py
           echo "# Placeholder script 1" > 01-pet-process-1km.py
           echo "# Placeholder script 2" > 02-gef-chirps-process-1km.py
           echo "# Placeholder script 3" > 03-imerg-process-1km.py
-          echo "Directory structure created:"
-          find . -type d | sort
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v2
