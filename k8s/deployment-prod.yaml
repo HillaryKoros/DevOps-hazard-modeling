@@ -14,7 +14,7 @@ spec:
         spec:
           containers:
           - name: hazard-modeling
-            image: ${DOCKERHUB_USERNAME}/hazard-modeling:latest
+            image: hkoros/hazard-modeling:sha-8fdd6d3
             resources:
               requests:
                 memory: "2Gi"
@@ -22,17 +22,6 @@ spec:
               limits:
                 memory: "4Gi"
                 cpu: "1000m"
-            env:
-            - name: API_KEY
-              valueFrom:
-                secretKeyRef:
-                  name: hazard-modeling-secrets
-                  key: API_KEY
-            - name: DATABASE_PASSWORD
-              valueFrom:
-                secretKeyRef:
-                  name: hazard-modeling-secrets
-                  key: DATABASE_PASSWORD
             volumeMounts:
             - name: data-volume
               mountPath: /app/data
@@ -45,6 +34,4 @@ spec:
           - name: output-volume
             persistentVolumeClaim:
               claimName: hazard-output-pvc
-          imagePullSecrets:
-          - name: docker-registry-credentials
           restartPolicy: OnFailure
