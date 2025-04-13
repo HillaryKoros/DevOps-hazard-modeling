@@ -1,4 +1,4 @@
-# Hazard Modeling DevOps Setup
+# Hazard Modeling DevOps Setup 
 
 This repository contains the configuration for running hazard modeling scripts as a containerized application on Kubernetes, managed by ArgoCD, and deployed locally using Minikube.
 
