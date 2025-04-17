@@ -478,7 +478,7 @@ def pet_read_netcdf_files_in_date_range(folder_path, start_date, end_date):
     combined_dataset1 = combined_dataset.rename(x='lon', y='lat') 
     return combined_dataset1
 
-def pet_extend_forecast(df, date_column, days_to_add=18):
+def pet_extend_forecast(df, date_column, days_to_add=16):
     """
     Add a specified number of days to the last date in a DataFrame, 
     repeating all values from the last row for non-date columns.
@@ -900,4 +900,261 @@ def pet_update_input_data(z1a, zone_input_path, zone_str, start_date, end_date):
     print(f"Created dated evap file in processed directory: {processed_dated_file}")
     
     # Return the path to the processed file (to be consistent with GEFS-CHIRPS)
+    return processed_dated_file
+
+
+
+def gefs_chirps_update_input_data(results_df, zone_input_path, zone_str, start_date, end_date):
+    """
+    Updates GEFS-CHIRPS input data by merging new data with existing data,
+    extending forecasts, and saving to required locations.
+
+    Parameters:
+    ----------
+    results_df : pandas.DataFrame
+        Dataframe containing GEFS-CHIRPS data that needs to be adjusted, pivoted, and formatted.
+    zone_input_path : str
+        Base path for input and output data files related to specific zones.
+    zone_str : str
+        Identifier for the specific zone, used for file naming and directory structure.
+    start_date : datetime
+        Start date for filtering the dataset.
+    end_date : datetime
+        End date for filtering the dataset.
+
+    Returns:
+    -------
+    str
+        Path to the output file in the processed directory.
+    """
+    
+    # Ensure zone_wise directory exists
+    zone_dir = f'{zone_input_path}{zone_str}'
+    os.makedirs(zone_dir, exist_ok=True)
+    
+    # Get base path for processed directory
+    base_path = zone_input_path.replace('zone_wise_txt_files/', '')
+    processed_dir = f'{base_path}geofsm-input/processed/{zone_str}'
+    os.makedirs(processed_dir, exist_ok=True)
+    
+    # Pivot the DataFrame
+    zz1 = results_df.pivot(index='time', columns='group', values='rain')
+    
+    # Apply formatting to the pivoted DataFrame
+    zz1 = zz1.apply(lambda row: row.map(lambda x: f'{x:.1f}' if isinstance(x, (int, float)) and pd.notna(x) else x), axis=1)
+    
+    # Reset the index and adjust columns
+    azz1 = zz1.reset_index()
+    azz1['NA'] = azz1['time'].dt.strftime('%Y%j')
+    azz1.columns = [str(col) if isinstance(col, int) else col for col in azz1.columns]
+    azz1 = azz1.rename(columns={'time': 'date'})
+    
+    # Path to standard rain.txt file in zone_wise directory
+    rain_file = f'{zone_dir}/rain.txt'
+    
+    # Check if the rain.txt file exists
+    if os.path.exists(rain_file):
+        # If file exists, read and merge with new data
+        try:
+            ez1 = pd.read_csv(rain_file, sep=",")
+            ez1['date'] = pd.to_datetime(ez1['NA'], format='%Y%j')
+            
+            # Create a mask for filtering data
+            mask = (ez1['date'] < start_date) | (ez1['date'] > end_date)
+            aez1 = ez1[mask]
+            
+            # Concatenate DataFrames
+            bz1 = pd.concat([aez1, azz1], axis=0)
+            
+            # Reset index and drop unnecessary columns
+            bz1.drop(['date'], axis=1, inplace=True)
+            bz1.reset_index(drop=True, inplace=True)
+        except Exception as e:
+            print(f"Error reading existing rain.txt: {e}")
+            print("Creating new rain.txt file instead")
+            bz1 = azz1.drop(['date'], axis=1).reset_index(drop=True)
+    else:
+        # If file doesn't exist, just use the new data
+        print(f"No existing rain.txt found at {rain_file}. Creating new file.")
+        bz1 = azz1.drop(['date'], axis=1).reset_index(drop=True)
+    
+    # Do not extend forecast data for GEFS-CHIRPS
+    bz2 = bz1  # Use data as is without extension
+    
+    # Format date for filename
+    end_date_str = end_date.strftime('%Y%j')  # Formats as "YearDayOfYear", e.g., "2024365"
+    
+    # 1. Create files in zone_wise_txt_files directory
+    
+    # Standard rain.txt file
+    bz2.to_csv(rain_file, index=False)
+    print(f"Created/updated standard rain.txt file: {rain_file}")
+    
+    # Zone-specific rain file (rain_zone1.txt)
+    zone_specific_file = f'{zone_dir}/rain_{zone_str}.txt'
+    bz2.to_csv(zone_specific_file, index=False)
+    print(f"Created zone-specific rain file: {zone_specific_file}")
+    
+    # Dated rain file (rain_2024365.txt)
+    dated_file = f'{zone_dir}/rain_{end_date_str}.txt'
+    bz2.to_csv(dated_file, index=False)
+    print(f"Created dated rain file: {dated_file}")
+    
+    # 2. Create files in geofsm-input/processed directory
+    
+    # Dated rain file in processed directory (rain_2024365.txt)
+    processed_dated_file = f'{processed_dir}/rain_{end_date_str}.txt'
+    bz2.to_csv(processed_dated_file, index=False)
+    print(f"Created dated rain file in processed directory: {processed_dated_file}")
+    
+    # Return the path to the processed file
+    return processed_dated_file
+
+
+def imerg_update_input_data(results_df, zone_input_path, zone_str, start_date, end_date):
+    """
+    Updates IMERG input data by merging new data with existing rain.txt data,
+    and saving to required locations. No forecast extension is applied.
+
+    Parameters:
+    ----------
+    results_df : pandas.DataFrame
+        Dataframe containing IMERG data that needs to be adjusted, pivoted, and formatted.
+    zone_input_path : str
+        Base path for input and output data files related to specific zones.
+    zone_str : str
+        Identifier for the specific zone, used for file naming and directory structure.
+    start_date : datetime
+        Start date for filtering the dataset.
+    end_date : datetime
+        End date for filtering the dataset.
+
+    Returns:
+    -------
+    str
+        Path to the output file in the processed directory.
+    """
+
+    
+    # Ensure zone_wise directory exists
+    zone_dir = f'{zone_input_path}{zone_str}'
+    os.makedirs(zone_dir, exist_ok=True)
+    
+    # Get base path for processed directory
+    base_path = zone_input_path.replace('zone_wise_txt_files/', '')
+    processed_dir = f'{base_path}geofsm-input/processed/{zone_str}'
+    os.makedirs(processed_dir, exist_ok=True)
+    
+    # Find the precipitation column - it might be named differently across implementations
+    precip_cols = [col for col in results_df.columns if col.lower() in ['precipitation', 'precip', 'rain']]
+    if not precip_cols:
+        standard_cols = ['time', 'group', 'spatial_ref', 'band']
+        precip_cols = [col for col in results_df.columns if col not in standard_cols]
+        
+    if not precip_cols:
+        raise ValueError(f"No precipitation column found in the DataFrame")
+    
+    # Use the first precipitation column found
+    precip_col = precip_cols[0]
+    print(f"Using precipitation column: {precip_col}")
+    
+    # Apply special IMERG rounding rules
+    def format_imerg_value(x):
+        if pd.isna(x):
+            return "0.0"
+        elif float(x) <= 0.01:
+            return "0.0"
+        else:
+            rounded = round(float(x) * 10) / 10
+            return f"{rounded:.1f}"
+
+    # Pivot the DataFrame
+    zz1 = results_df.pivot(index='time', columns='group', values=precip_col)
+    
+    # Apply IMERG-specific formatting to the pivoted DataFrame
+    zz1 = zz1.apply(lambda row: row.map(lambda x: format_imerg_value(x)), axis=1)
+    
+    # Reset the index and adjust columns
+    azz1 = zz1.reset_index()
+    azz1['NA'] = azz1['time'].dt.strftime('%Y%j')
+    azz1.columns = [str(col) if isinstance(col, int) else col for col in azz1.columns]
+    azz1 = azz1.rename(columns={'time': 'date'})
+    
+    # Path to standard rain.txt file in zone_wise directory (using rain.txt instead of imerg.txt)
+    rain_file = f'{zone_dir}/rain.txt'
+    
+    # Check if the rain.txt file exists
+    if os.path.exists(rain_file):
+        # If file exists, read and merge with new data
+        try:
+            ez1 = pd.read_csv(rain_file, sep=",")
+            ez1['date'] = pd.to_datetime(ez1['NA'], format='%Y%j')
+            
+            # Create a mask for filtering data
+            mask = (ez1['date'] < start_date) | (ez1['date'] > end_date)
+            aez1 = ez1[mask]
+            
+            # Concatenate DataFrames
+            bz1 = pd.concat([aez1, azz1], axis=0)
+            
+            # Reset index and drop unnecessary columns
+            bz1.drop(['date'], axis=1, inplace=True)
+            bz1.reset_index(drop=True, inplace=True)
+        except Exception as e:
+            print(f"Error reading existing rain.txt: {e}")
+            print("Creating new rain.txt file instead")
+            bz1 = azz1.drop(['date'], axis=1).reset_index(drop=True)
+    else:
+        # If file doesn't exist, just use the new data
+        print(f"No existing rain.txt found at {rain_file}. Creating new file.")
+        bz1 = azz1.drop(['date'], axis=1).reset_index(drop=True)
+    
+    # Do not extend forecast data for IMERG
+    bz2 = bz1  # Use data as is without extension
+    
+    # Format date for filename
+    end_date_str = end_date.strftime('%Y%j')  # Formats as "YearDayOfYear", e.g., "2024365"
+    
+    # 1. Create files in zone_wise_txt_files directory
+    
+    # Standard rain.txt file (using rain.txt instead of imerg.txt)
+    bz2.to_csv(rain_file, index=False)
+    print(f"Created/updated standard rain.txt file: {rain_file}")
+    
+    # Zone-specific rain file (rain_zone1.txt)
+    zone_specific_file = f'{zone_dir}/rain_{zone_str}.txt'
+    bz2.to_csv(zone_specific_file, index=False)
+    print(f"Created zone-specific rain file: {zone_specific_file}")
+    
+    # Dated rain file (rain_2024365.txt)
+    dated_file = f'{zone_dir}/rain_{end_date_str}.txt'
+    bz2.to_csv(dated_file, index=False)
+    print(f"Created dated rain file: {dated_file}")
+    
+    # Also save copies as imerg files for tracking purposes
+    imerg_file = f'{zone_dir}/imerg.txt'
+    bz2.to_csv(imerg_file, index=False)
+    print(f"Created/updated imerg.txt file: {imerg_file}")
+    
+    imerg_zone_file = f'{zone_dir}/imerg_{zone_str}.txt'
+    bz2.to_csv(imerg_zone_file, index=False)
+    print(f"Created zone-specific imerg file: {imerg_zone_file}")
+    
+    imerg_dated_file = f'{zone_dir}/imerg_{end_date_str}.txt'
+    bz2.to_csv(imerg_dated_file, index=False)
+    print(f"Created dated imerg file: {imerg_dated_file}")
+    
+    # 2. Create files in geofsm-input/processed directory
+    
+    # Also save a copy specifically labeled as imerg for tracking purposes
+    imerg_processed_file = f'{processed_dir}/imerg_{end_date_str}.txt'
+    bz2.to_csv(imerg_processed_file, index=False)
+    print(f"Created imerg dated file in processed directory: {imerg_processed_file}")
+    
+    # Dated rain file in processed directory (rain_2024365.txt)
+    processed_dated_file = f'{processed_dir}/rain_{end_date_str}.txt'
+    bz2.to_csv(processed_dated_file, index=False)
+    print(f"Created dated rain file in processed directory: {processed_dated_file}")
+    
+    # Return the path to the processed file
     return processed_dated_file
