@@ -16,7 +16,11 @@ from utils import (
     imerg_download_files,
     imerg_read_tiffs_to_dataset,
     get_dask_client_params,
-    make_zones_geotif
+    make_zones_geotif,
+    imerg_update_input_data,
+    process_zone_from_combined,
+    regrid_dataset,
+    zone_mean_df
 )
 
 load_dotenv()
@@ -26,12 +30,288 @@ yesterday = (datetime.now() - timedelta(days=1)).strftime('%Y%m%d')
 
 @task
 def setup_environment():
+    """Set up the environment for data processing"""
     data_path = os.getenv("data_path", "./data/")  # Default to ./data/ if not set
     imerg_store = f'{data_path}geofsm-input/imerg'
+    zone_input_path = f"{data_path}zone_wise_txt_files/"
+    init_zone_path = f"{data_path}zone_wise_txt_files/init/"
+    
+    # Create all necessary directories
+    os.makedirs(imerg_store, exist_ok=True)
+    os.makedirs(zone_input_path, exist_ok=True)
+    os.makedirs(init_zone_path, exist_ok=True)
+    
     params = get_dask_client_params()
     client = Client(**params)
-    print(f"Environment setup: data_path={data_path}, imerg_store={imerg_store}")
+    
+    print(f"Environment setup complete. Using data_path: {data_path}")
+    print(f"Created standard output directory: {zone_input_path}")
+    print(f"Created base output directory (no forecast): {init_zone_path}")
     return data_path, imerg_store, client
+
+def get_last_date_from_rain(zone_dir, is_init=False):
+    """
+    Read the existing rain.txt file and determine the last date in the file.
+    
+    Parameters:
+    ----------
+    zone_dir : str
+        Path to the zone directory containing rain.txt
+    is_init : bool
+        Flag indicating if this is the init directory (for logging purposes)
+        
+    Returns:
+    -------
+    datetime
+        The last date in the file, or None if the file doesn't exist or can't be read
+    """
+    rain_file = os.path.join(zone_dir, 'rain.txt')
+    dir_type = "init" if is_init else "standard"
+    
+    if not os.path.exists(rain_file):
+        print(f"No existing rain.txt found at {rain_file} ({dir_type} directory)")
+        return None
+    
+    try:
+        # Read the rain.txt file
+        df = pd.read_csv(rain_file, sep=",")
+        
+        # Check if NA column exists (which contains the dates in YYYYDDD format)
+        if 'NA' not in df.columns:
+            print(f"Invalid format in rain.txt ({dir_type} directory) - missing 'NA' column")
+            return None
+        
+        # Convert the last date to datetime
+        last_date_str = df['NA'].iloc[-1]
+        last_date = datetime.strptime(str(last_date_str), '%Y%j')
+        
+        print(f"Last date in {dir_type} rain.txt: {last_date.strftime('%Y-%m-%d')} (Day {last_date_str})")
+        return last_date
+        
+    except Exception as e:
+        print(f"Error reading existing rain.txt ({dir_type} directory): {e}")
+        return None
+
+def imerg_extend_forecast_improved(df, date_column, days_to_add=16):
+    """
+    Add a forecast extension by copying the last 15 days of data and appending it
+    to create a 16-day forecast.
+    
+    Parameters:
+    df (pd.DataFrame): Input DataFrame
+    date_column (str): Name of the column containing dates in 'YYYYDDD' format
+    days_to_add (int): Number of days to add for forecast (default is 16)
+    
+    Returns:
+    pd.DataFrame: DataFrame with additional forecast rows
+    """
+    # Create a copy of the input DataFrame to avoid modifying the original
+    df = df.copy()
+    
+    # Function to safely convert date string to datetime
+    def safe_to_datetime(date_str):
+        try:
+            return datetime.strptime(str(date_str), '%Y%j')
+        except ValueError:
+            return None
+
+    # Convert date column to datetime for processing
+    df['_temp_date'] = df[date_column].apply(safe_to_datetime)
+    
+    # Remove any rows where the date conversion failed
+    df = df.dropna(subset=['_temp_date'])
+    
+    if df.empty:
+        print(f"No valid dates found in the '{date_column}' column.")
+        return df
+        
+    # Sort by date to ensure correct order
+    df = df.sort_values('_temp_date')
+    
+    # Get the last 15 days of data (or fewer if less available)
+    days_to_copy = min(15, len(df))
+    historical_pattern = df.iloc[-days_to_copy:].copy()
+    
+    # Create new rows for forecast
+    new_rows = []
+    last_date = df['_temp_date'].iloc[-1]
+    
+    for i in range(days_to_add):
+        # Calculate the new date
+        new_date = last_date + timedelta(days=i+1)
+        
+        # Get corresponding historical row (cycling through the pattern)
+        historical_idx = i % len(historical_pattern)
+        new_row = historical_pattern.iloc[historical_idx].copy()
+        
+        # Update the date
+        new_row['_temp_date'] = new_date
+        new_rows.append(new_row)
+    
+    # Convert new_rows to a DataFrame
+    new_rows_df = pd.DataFrame(new_rows)
+    
+    # Concatenate the new rows to the original DataFrame
+    result_df = pd.concat([df, new_rows_df], ignore_index=True)
+    
+    # Convert date column back to the original string format and remove temp column
+    result_df[date_column] = result_df['_temp_date'].dt.strftime('%Y%j')
+    result_df = result_df.drop(columns=['_temp_date'])
+    
+    return result_df
+
+def imerg_update_input_data_improved(z1a, zone_input_path, zone_str, start_date, end_date):
+    """
+    Processes precipitation data and generates:
+    1. Standard rain.txt and zone-specific rain_zone*.txt files (without forecast)
+    2. Base rain.txt and zone-specific rain_zone*.txt files (without forecast) in 'init' folder
+    
+    For IMERG data, we don't add a forecast extension to either set of files.
+    
+    Parameters:
+    ----------
+    z1a : pandas.DataFrame
+        Dataframe containing IMERG data that needs to be adjusted, pivoted, and formatted.
+    zone_input_path : str
+        Base path for input and output data files related to specific zones.
+    zone_str : str
+        Identifier for the specific zone, used for file naming and directory structure.
+    start_date : datetime
+        Start date for filtering the dataset.
+    end_date : datetime
+        End date for filtering the dataset.
+
+    Returns:
+    -------
+    tuple
+        Paths to the four generated files (standard rain.txt, zone-specific rain file, 
+        base rain.txt without forecast, and base zone-specific rain file without forecast).
+    """
+    # Ensure all directories exist
+    zone_dir = f'{zone_input_path}{zone_str}'
+    init_zone_dir = f'{zone_input_path}init/{zone_str}'
+    
+    # Create directories recursively if they don't exist
+    os.makedirs(zone_dir, exist_ok=True)
+    os.makedirs(init_zone_dir, exist_ok=True)
+    
+    print(f"Ensuring output directories exist for {zone_str}:")
+    print(f"  - Standard directory: {zone_dir}")
+    print(f"  - Base directory (no forecast): {init_zone_dir}")
+    
+    # Process the data - assuming 'precipitation' is the column name in z1a
+    # If the column name is different, adjust this as needed
+    if 'precipitation' in z1a.columns:
+        # Convert the precipitation to the format needed
+        # This is where you would apply any scaling factors if needed
+        # Example: z1a['precipitation'] = z1a['precipitation'] * scaling_factor
+        pass
+    
+    # Pivot the DataFrame
+    zz1 = z1a.pivot(index='time', columns='group', values='precipitation')
+    
+    # Apply formatting to the pivoted DataFrame
+    zz1 = zz1.apply(lambda row: row.map(lambda x: f'{x:.1f}' if isinstance(x, (int, float)) and pd.notna(x) else x), axis=1)
+    
+    # Reset the index and adjust columns
+    azz1 = zz1.reset_index()
+    azz1['NA'] = azz1['time'].dt.strftime('%Y%j')
+    azz1.columns = [str(col) if isinstance(col, int) else col for col in azz1.columns]
+    azz1 = azz1.rename(columns={'time': 'date'})
+    
+    # Path to standard rain.txt file in zone_wise directory
+    rain_file = f'{zone_dir}/rain.txt'
+    
+    # Path to base rain.txt file in init directory (without forecast)
+    base_rain_file = f'{init_zone_dir}/rain.txt'
+    
+    # Check if the standard rain.txt file exists
+    if os.path.exists(rain_file):
+        # If file exists, read and merge with new data
+        try:
+            ez1 = pd.read_csv(rain_file, sep=",")
+            ez1['date'] = pd.to_datetime(ez1['NA'], format='%Y%j')
+            
+            # Create a mask for filtering data
+            mask = (ez1['date'] < start_date) | (ez1['date'] > end_date)
+            aez1 = ez1[mask]
+            
+            # Concatenate DataFrames
+            bz1 = pd.concat([aez1, azz1], axis=0)
+            
+            # Reset index and drop unnecessary columns
+            bz1.drop(['date'], axis=1, inplace=True)
+            bz1.reset_index(drop=True, inplace=True)
+        except Exception as e:
+            print(f"Error reading existing rain.txt: {e}")
+            print("Creating new rain.txt file instead")
+            bz1 = azz1.drop(['date'], axis=1).reset_index(drop=True)
+    else:
+        # If file doesn't exist, just use the new data
+        print(f"No existing rain.txt found at {rain_file}. Creating new file.")
+        bz1 = azz1.drop(['date'], axis=1).reset_index(drop=True)
+    
+    # Do the same for the base rain file (without forecast)
+    if os.path.exists(base_rain_file):
+        try:
+            base_ez1 = pd.read_csv(base_rain_file, sep=",")
+            base_ez1['date'] = pd.to_datetime(base_ez1['NA'], format='%Y%j')
+            
+            # Create a mask for filtering data
+            mask = (base_ez1['date'] < start_date) | (base_ez1['date'] > end_date)
+            base_aez1 = base_ez1[mask]
+            
+            # Concatenate DataFrames
+            base_bz1 = pd.concat([base_aez1, azz1], axis=0)
+            
+            # Reset index and drop unnecessary columns
+            base_bz1.drop(['date'], axis=1, inplace=True)
+            base_bz1.reset_index(drop=True, inplace=True)
+        except Exception as e:
+            print(f"Error reading existing base rain.txt: {e}")
+            print("Creating new base rain.txt file instead")
+            base_bz1 = azz1.drop(['date'], axis=1).reset_index(drop=True)
+    else:
+        # If file doesn't exist, just use the new data
+        print(f"No existing base rain.txt found at {base_rain_file}. Creating new file.")
+        base_bz1 = azz1.drop(['date'], axis=1).reset_index(drop=True)
+    
+    # Ensure all values in NA column are strings for consistent sorting
+    if 'NA' in bz1.columns:
+        bz1['NA'] = bz1['NA'].astype(str)
+    if 'NA' in base_bz1.columns:
+        base_bz1['NA'] = base_bz1['NA'].astype(str)
+    
+    # Sort the data by NA column (date) to ensure proper order
+    bz1 = bz1.sort_values(by='NA').reset_index(drop=True)
+    base_bz1 = base_bz1.sort_values(by='NA').reset_index(drop=True)
+    
+    # For IMERG, we do NOT add a forecast extension to either set of files
+    # Both standard and base files will be identical
+    
+    # Create standard files (without forecast for IMERG)
+    
+    # 1. Standard rain.txt file
+    bz1.to_csv(rain_file, index=False)
+    print(f"Created/updated standard rain.txt file: {rain_file}")
+    
+    # 2. Zone-specific rain file (rain_zone1.txt)
+    zone_specific_file = f'{zone_dir}/rain_{zone_str}.txt'
+    bz1.to_csv(zone_specific_file, index=False)
+    print(f"Created zone-specific rain file: {zone_specific_file}")
+    
+    # Create base files (also without forecast)
+    
+    # 3. Base rain.txt file
+    base_bz1.to_csv(base_rain_file, index=False)
+    print(f"Created/updated base rain.txt file: {base_rain_file}")
+    
+    # 4. Zone-specific base rain file
+    base_zone_specific_file = f'{init_zone_dir}/rain_{zone_str}.txt'
+    base_bz1.to_csv(base_zone_specific_file, index=False)
+    print(f"Created base zone-specific rain file: {base_zone_specific_file}")
+    
+    return rain_file, zone_specific_file, base_rain_file, base_zone_specific_file
 
 @task
 def get_imerg_files(start_date, end_date):
@@ -114,63 +394,6 @@ def rename_coordinates(imerg_data):
     
     return renamed_data
 
-def process_zone_from_combined(master_shapefile, zone_name, km_str, pds):
-    """
-    Process a specific zone from a combined shapefile and subset data based on that zone.
-    Handles datasets with either lat/lon or x/y coordinate systems.
-    Works with both DataArray and Dataset objects.
-    """
-    # Read the master shapefile
-    all_zones = gp.read_file(master_shapefile)
-    
-    # Filter for the specific zone
-    zone_gdf = all_zones[all_zones['zone'] == zone_name].copy()
-    
-    if zone_gdf.empty:
-        raise ValueError(f"Zone '{zone_name}' not found in the shapefile.")
-    
-    # Create a temporary directory for the zone-specific shapefile if it doesn't exist
-    temp_dir = os.path.join(os.path.dirname(master_shapefile), "temp")
-    os.makedirs(temp_dir, exist_ok=True)
-    
-    # Save the filtered zone as a temporary shapefile
-    temp_shapefile = os.path.join(temp_dir, f"{zone_name}.shp")
-    zone_gdf.to_file(temp_shapefile)
-    
-    # Generate the output path for the zone GeoTIFF
-    zone1_tif = make_zones_geotif(temp_shapefile, km_str, zone_name)
-
-    # Load and process the generated GeoTIFF
-    z1ds = rioxarray.open_rasterio(zone1_tif, chunks="auto").squeeze()
-    z1crds = z1ds.rename(x='lon', y='lat')
-    z1county_id = np.unique(z1crds.data).compute()
-    z1lat_max = z1crds['lat'].max().values
-    z1lat_min = z1crds['lat'].min().values
-    z1lon_max = z1crds['lon'].max().values
-    z1lon_min = z1crds['lon'].min().values
-
-    zone_extent = {
-        'lat_max': z1lat_max,
-        'lat_min': z1lat_min,
-        'lon_max': z1lon_max,
-        'lon_min': z1lon_min
-    }
-
-    print(f"Input object type: {type(pds).__name__}")
-    print(f"Zone extent: lat({z1lat_min}, {z1lat_max}), lon({z1lon_min}, {z1lon_max})")
-    
-    # Determine which coordinate system the input data uses
-    if 'lat' in pds.dims and 'lon' in pds.dims:
-        print("Using lat/lon coordinates for subsetting")
-        pz1ds = pds.sel(lat=slice(z1lat_max, z1lat_min), lon=slice(z1lon_min, z1lon_max))
-    elif 'y' in pds.dims and 'x' in pds.dims:
-        print("Using x/y coordinates for subsetting")
-        pz1ds = pds.sel(y=slice(z1lat_max, z1lat_min), x=slice(z1lon_min, z1lon_max))
-    else:
-        raise ValueError(f"Data has unrecognized coordinate dimensions: {list(pds.dims)}")
-
-    return z1crds, pz1ds, zone_extent
-
 @task
 def process_zone(data_path, imerg_data, zone_str):
     """Process a zone from the combined shapefile"""
@@ -180,249 +403,132 @@ def process_zone(data_path, imerg_data, zone_str):
     print(f"Processed zone {zone_str}")
     return z1ds, zone_subset_ds, zone_extent
 
-def regrid_dataset(input_ds, input_chunk_sizes, output_chunk_sizes, zone_extent, regrid_method="bilinear"):
-    """
-    Regrid a dataset to a specified output grid using a specified regridding method.
-    """
-    # Extract lat/lon extents from the dictionary
-    z1lat_min = zone_extent['lat_min']
-    z1lat_max = zone_extent['lat_max']
-    z1lon_min = zone_extent['lon_min']
-    z1lon_max = zone_extent['lon_max']
-
-    # Create output grid with appropriate chunking
-    ds_out = xr.Dataset({
-        "lat": (["lat"], np.arange(z1lat_min, z1lat_max, 0.01), {"units": "degrees_north"}),
-        "lon": (["lon"], np.arange(z1lon_min, z1lon_max, 0.01), {"units": "degrees_east"})
-    }).chunk(output_chunk_sizes)
-
-    # Create regridder with specified output_chunks
-    regridder = xe.Regridder(input_ds, ds_out, regrid_method)
-
-    # Define regridding function with output_chunks
-    def regrid_chunk(chunk):
-        return regridder(chunk, output_chunks=output_chunk_sizes)
-
-    # Apply regridding to each chunk
-    regridded = input_ds.groupby('time').map(regrid_chunk)
-
-    # Compute results
-    with ProgressBar():
-        result = regridded.compute()
-    
-    # Ensure the result has a name if it's a DataArray
-    if isinstance(result, xr.DataArray) and not result.name:
-        result = result.rename('precipitation')
-        print("Named regridded DataArray as 'precipitation'")
-
-    return result
-
 @task
 def regrid_precipitation_data(zone_subset_ds, input_chunk_sizes, output_chunk_sizes, zone_extent):
     """Regrid the precipitation data to match the zone extent at 1km resolution"""
-    return regrid_dataset(
+    print(f"Input to regridding - type: {type(zone_subset_ds).__name__}, name: {getattr(zone_subset_ds, 'name', 'unnamed')}")
+    
+    # Get the result from regrid_dataset function
+    result = regrid_dataset(
         zone_subset_ds,
         input_chunk_sizes,
         output_chunk_sizes,
         zone_extent,
         regrid_method="bilinear"
     )
-
-def zone_mean_df(input_ds, zone_ds):
-    """
-    Compute the mean of values in `input_ds` grouped by zones defined in `zone_ds`.
-    Works with both named and unnamed DataArrays.
-    """
-    # Print input dataset info for debugging
-    print(f"Input dataset type: {type(input_ds).__name__}")
-    print(f"Input dataset name: {getattr(input_ds, 'name', 'unnamed')}")
     
-    # Align datasets
-    z1d_, aligned_zone_ds = xr.align(input_ds, zone_ds, join="override")
+    # Ensure the result has a name if it's a DataArray
+    if isinstance(result, xr.DataArray) and not result.name:
+        result = result.rename('precipitation')
+        print("Named regridded DataArray as 'precipitation' in regrid_precipitation_data task")
     
-    # Group by aligned zone dataset
-    z1 = input_ds.groupby(aligned_zone_ds).mean()
+    # Double-check the output
+    print(f"Output from regridding - type: {type(result).__name__}, name: {getattr(result, 'name', 'unnamed')}")
     
-    # If the DataArray has no name, assign one before converting to DataFrame
-    if isinstance(z1, xr.DataArray) and not z1.name:
-        print("Assigning name 'precipitation' to unnamed DataArray")
-        z1 = z1.rename('precipitation')
-    
-    # Convert to DataFrame
-    z1 = z1.to_dataframe()
-    z1a = z1.reset_index()
-    
-    return z1a
+    return result
 
 @task
 def calculate_zone_means(regridded_data, zone_ds):
     """Calculate zonal means for the regridded data"""
+    print(f"Input to zone_mean_df - type: {type(regridded_data).__name__}, name: {getattr(regridded_data, 'name', 'unnamed')}")
+    
+    # Ensure the input DataArray has a name
+    if isinstance(regridded_data, xr.DataArray) and not regridded_data.name:
+        print("WARNING: Received unnamed DataArray, renaming to 'precipitation'")
+        regridded_data = regridded_data.rename('precipitation')
+    
+    # Now call zone_mean_df with the properly named data
     return zone_mean_df(regridded_data, zone_ds)
 
 @task
-def save_csv_results(results_df, data_path, zone_str, date_string):
-    """Save the zonal means to a CSV file"""
-    output_dir = f"{data_path}geofsm-input/processed/{zone_str}"
-    os.makedirs(output_dir, exist_ok=True)
-    output_file = f"{output_dir}/imerg_{date_string}.csv"
-    results_df.to_csv(output_file, index=False)
-    print(f"CSV results saved to {output_file}")
-    return output_file
-
-
-@task
-def convert_csv_to_txt_format(input_csv_path):
+def save_imerg_results(results_df, data_path, zone_str, start_date, end_date):
     """
-    Convert IMERG CSV data to the required imerg_{date}.txt format with improved handling
-    of small precipitation values and proper pivoting.
-    
-    This function properly handles scientific notation and very small precipitation values,
-    ensuring they are preserved as 0.1 in the output rather than being converted to 0.0.
-    
-    Args:
-        input_csv_path: Path to the input CSV file (e.g., 'imerg_20250410.csv')
-        
-    Returns:
-        Path to the output TXT file (e.g., 'imerg_2025100.txt') or None if conversion failed
+    Save processed IMERG results and update input data.
+    This will create both standard files with forecast and base files without forecast.
     """
-    import os
-    import pandas as pd
-    from datetime import datetime
-    
-    filename = os.path.basename(input_csv_path)
-    # Extract date string from filename (assumes pattern 'imerg_YYYYMMDD.csv')
-    if filename.startswith('imerg_'):
-        date_string = filename.replace('imerg_', '').replace('.csv', '')
-        try:
-            date_obj = datetime.strptime(date_string, '%Y%m%d')
-            date_ddd = date_obj.strftime('%Y%j')  # Format as YYYYDDD where DDD is day of year
-        except ValueError:
-            date_ddd = date_string
-    else:
-        date_ddd = 'converted'
-
-    output_dir = os.path.dirname(input_csv_path)
-    output_txt_path = os.path.join(output_dir, f"imerg_{date_ddd}.txt")
-
     try:
-        # Read the CSV file
-        df = pd.read_csv(input_csv_path)
+        # Create output directory for CSV files
+        output_dir = f"{data_path}geofsm-input/processed/{zone_str}"
+        os.makedirs(output_dir, exist_ok=True)
         
-        # Verify required columns exist
-        required_cols = ['time', 'group']
-        if not all(col in df.columns for col in required_cols):
-            print(f"Error: Required columns not found in {input_csv_path}")
-            print(f"Available columns: {df.columns.tolist()}")
-            return None
-
-        # Find the precipitation column - it might be named 'precipitation', 'rain' or similar
-        precip_cols = [col for col in df.columns if col.lower() in ['precipitation', 'precip', 'rain']]
-        if not precip_cols:
-            # If no obvious precipitation column, use any column that's not in a standard set
-            standard_cols = ['time', 'group', 'spatial_ref', 'band']
-            precip_cols = [col for col in df.columns if col not in standard_cols]
+        # Format dates to ensure they are datetime objects
+        if not isinstance(start_date, datetime):
+            start_date = pd.to_datetime(start_date)
+        if not isinstance(end_date, datetime):
+            end_date = pd.to_datetime(end_date)
             
-        if not precip_cols:
-            print(f"Error: No precipitation column found in {input_csv_path}")
-            return None
+        # Save CSV file for future reference
+        date_string = start_date.strftime('%Y%m%d')
+        csv_file = f"{output_dir}/imerg_{date_string}.csv"
+        results_df.to_csv(csv_file, index=False)
+        print(f"CSV results saved to {csv_file}")
         
-        # Use the first precipitation column found
-        precip_col = precip_cols[0]
-        print(f"Using precipitation column: {precip_col}")
+        # Create zone input path
+        zone_input_path = f"{data_path}zone_wise_txt_files/"
         
-        # Convert date format: YYYY-MM-DD to YYYYDDD format
-        df['NA'] = df['time'].apply(lambda x: 
-                                   datetime.strptime(str(x), '%Y-%m-%d').strftime('%Y%j'))
+        # Update IMERG input data - generate both standard files with forecast and base files without forecast
+        rain_file, zone_specific_file, base_rain_file, base_zone_specific_file = imerg_update_input_data_improved(
+            results_df, zone_input_path, zone_str, start_date, end_date
+        )
         
-        # Sort unique dates and groups
-        dates = sorted(df['NA'].unique())
-        groups = sorted(df['group'].unique())
+        print(f"IMERG input data updated:")
+        print(f"  - Standard files (with forecast): {rain_file} and {zone_specific_file}")
+        print(f"  - Base files (without forecast): {base_rain_file} and {base_zone_specific_file}")
         
-        # Create result dataframe with proper column structure
-        result_columns = ['NA'] + [str(int(g)) for g in groups]
-        result_df = pd.DataFrame(columns=result_columns)
-        result_df['NA'] = dates
-        
-        # Initialize all precipitation values to 0.0
-        for col in result_columns:
-            if col != 'NA':
-                result_df[col] = "0.0"
-        
-        # Fill values by group
-        for group in groups:
-            group_str = str(int(group))
-            group_data = df[df['group'] == group]
-            
-            # For each date and group, get the precipitation value
-            for date in dates:
-                date_group_data = group_data[group_data['NA'] == date]
-                if not date_group_data.empty:
-                    # Get precipitation value
-                    value = date_group_data[precip_col].iloc[0]
-                    
-                    # Apply the new rounding rules
-                    if value <= 0.01:
-                        # Values <= 0.01 become 0.0
-                        formatted_value = "0.0"
-                    else:
-                        # Round to nearest 0.1 using standard rounding rules
-                        rounded = round(float(value) * 10) / 10
-                        formatted_value = f"{rounded:.1f}"
-                        
-                    # Update the result dataframe
-                    result_df.loc[result_df['NA'] == date, group_str] = formatted_value
-        
-        # Write result to text file
-        header_line = ",".join(result_columns)
-        with open(output_txt_path, 'w') as f:
-            f.write(header_line + '\n')
-            # Use to_csv without index, without header, and with Windows line endings
-            result_df.to_csv(f, index=False, header=False, lineterminator='\n')
-        
-        print(f"Successfully converted {input_csv_path} to {output_txt_path}")
-        return output_txt_path
-    
+        return rain_file, zone_specific_file, base_rain_file, base_zone_specific_file
     except Exception as e:
-        print(f"Error converting {input_csv_path}: {e}")
-        return None
-@task
-def copy_to_zone_wise_txt(data_path, zone_str, txt_file):
-    """Copy the text file to the zone-wise directory"""
-    zone_wise_dir = f"{data_path}zone_wise_txt_files/{zone_str}"
-    os.makedirs(zone_wise_dir, exist_ok=True)
-    # Update filename to include zone number
-    dst_file = f"{zone_wise_dir}/imerg_{zone_str}.txt"
-    with open(txt_file, 'r') as src_f:
-        content = src_f.read()
-    with open(dst_file, 'w') as dst_f:
-        dst_f.write(content)
-    print(f"Copied {txt_file} to {dst_file}")
-    return dst_file
+        print(f"Error saving IMERG results: {e}")
+        raise
 
 @flow
-def process_single_zone(data_path, imerg_data, zone_str, date_string, copy_to_zone_wise=False):
-    """Process a single zone"""
-    print(f"Processing zone {zone_str}...")
-    z1ds, zone_subset_ds, zone_extent = process_zone(data_path, imerg_data, zone_str)
+def process_single_zone(data_path, imerg_data, zone_str, start_date, end_date):
+    """Process a single zone across multiple dates"""
+    print(f"Processing zone {zone_str} from {start_date.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')}")
     
-    # Adjust input_chunk_sizes based on the dimensions in the data
-    if 'lat' in zone_subset_ds.dims and 'lon' in zone_subset_ds.dims:
-        input_chunk_sizes = {'time': 10, 'lat': 30, 'lon': 30}
-    else:
-        input_chunk_sizes = {'time': 10, 'y': 30, 'x': 30}
+    # Standardize zone string format
+    if not isinstance(zone_str, str):
+        zone_str = str(zone_str)
+        
+    if zone_str.isdigit():
+        zone_str = f'zone{zone_str}'
+    elif not zone_str.startswith('zone'):
+        zone_str = f'zone{zone_str}'
     
-    output_chunk_sizes = {'lat': 300, 'lon': 300}
-    regridded_data = regrid_precipitation_data(zone_subset_ds, input_chunk_sizes, output_chunk_sizes, zone_extent)
-    zone_means = calculate_zone_means(regridded_data, z1ds)
-    csv_file = save_csv_results(zone_means, data_path, zone_str, date_string)
-    txt_file = convert_csv_to_txt_format(csv_file)
-    if copy_to_zone_wise and txt_file:
-        copy_to_zone_wise_txt(data_path, zone_str, txt_file)
-    return txt_file
+    try:
+        # Process this zone
+        z1ds, zone_subset_ds, zone_extent = process_zone(data_path, imerg_data, zone_str)
+        
+        # Adjust input_chunk_sizes based on the dimensions in the data
+        if 'lat' in zone_subset_ds.dims and 'lon' in zone_subset_ds.dims:
+            input_chunk_sizes = {'time': 10, 'lat': 30, 'lon': 30}
+        else:
+            input_chunk_sizes = {'time': 10, 'y': 30, 'x': 30}
+        
+        output_chunk_sizes = {'lat': 300, 'lon': 300}
+        regridded_data = regrid_precipitation_data(zone_subset_ds, input_chunk_sizes, output_chunk_sizes, zone_extent)
+        zone_means = calculate_zone_means(regridded_data, z1ds)
+        
+        # Save the results with both standard (with forecast) and base (without forecast) files
+        rain_file, zone_specific_file, base_rain_file, base_zone_specific_file = save_imerg_results(
+            zone_means, data_path, zone_str, start_date, end_date
+        )
+        
+        return rain_file, zone_specific_file, base_rain_file, base_zone_specific_file
+    except Exception as e:
+        print(f"Error in process_single_zone for {zone_str}: {e}")
+        return None, None, None, None
 
 @flow
-def imerg_all_zones_workflow(start_date: str = yesterday, end_date: str = "", copy_to_zone_wise: bool = False):
-    """Process IMERG data for all zones"""
+def imerg_all_zones_workflow(start_date: str = yesterday, end_date: str = ""):
+    """
+    Main workflow for processing IMERG data for all zones.
+    Creates two sets of output files:
+    1. Standard files with a 16-day forecast extension based on the last 15 days
+    2. Base files containing only the actual data without any forecast extension
+    
+    Returns:
+        Dict containing the paths to all generated txt files
+    """
     # Handle default values for start_date and end_date
     if not start_date:
         start_date = yesterday
@@ -431,39 +537,162 @@ def imerg_all_zones_workflow(start_date: str = yesterday, end_date: str = "", co
         # Default to same as start_date if not specified
         end_date = start_date
     
-    date_string = start_date  # Use start date for output filenames
-    
     data_path, imerg_store, client = setup_environment()
+    
     try:
-        # Get file list
-        file_list = get_imerg_files(start_date, end_date)
-        
-        # Download files
-        download_dir = download_imerg_files(file_list, imerg_store)
-        
-        # Process data
-        imerg_data = process_imerg_data(download_dir, start_date, end_date)
-        
-        # Rename coordinates from x,y to lon,lat if needed
-        imerg_data = rename_coordinates(imerg_data)
-        
-        # Get all zones
+        # Check if master shapefile exists before continuing
         master_shapefile = f'{data_path}WGS/geofsm-prod-all-zones-20240712.shp'
+        if not os.path.exists(master_shapefile):
+            print(f"ERROR: Master shapefile not found at {master_shapefile}")
+            raise FileNotFoundError(f"Master shapefile not found: {master_shapefile}")
+        else:
+            print(f"Found master shapefile: {master_shapefile}")
+        
+        # Process all zones from the shapefile
         all_zones = gp.read_file(master_shapefile)
         unique_zones = all_zones['zone'].unique()
         
-        # Process each zone
-        output_files = []
+        # Initialize variables for collecting output files
+        standard_files = []  # Files with forecast
+        base_files = []      # Files without forecast
+        
+        # Create a reference to the task in this scope
+        get_imerg_files_task = get_imerg_files
+        
+        # Process each zone separately
         for zone_str in unique_zones:
             try:
-                txt_file = process_single_zone(data_path, imerg_data, zone_str, date_string, copy_to_zone_wise)
-                if txt_file:
-                    output_files.append(txt_file)
+                # Standardize zone string format
+                if not isinstance(zone_str, str):
+                    zone_str = str(zone_str)
+                    
+                if zone_str.isdigit():
+                    zone_str = f'zone{zone_str}'
+                elif not zone_str.startswith('zone'):
+                    zone_str = f'zone{zone_str}'
+                
+                print(f"\n===== Processing {zone_str} =====")
+                
+                # Ensure all required directories exist for this zone
+                zone_dir = f"{data_path}zone_wise_txt_files/{zone_str}"
+                init_zone_dir = f"{data_path}zone_wise_txt_files/init/{zone_str}"
+                
+                # Recursively create all necessary directories
+                os.makedirs(zone_dir, exist_ok=True)
+                os.makedirs(init_zone_dir, exist_ok=True)
+                
+                print(f"Ensuring directories exist for {zone_str}:")
+                print(f"  - Standard directory: {zone_dir}")
+                print(f"  - Base directory: {init_zone_dir}")
+                
+                # Always check the init directory first as it contains the reliable historical data
+                last_date = get_last_date_from_rain(init_zone_dir, is_init=True)
+                if last_date is None:
+                    # Only if init directory has no data, check the standard directory
+                    last_date = get_last_date_from_rain(zone_dir, is_init=False)
+                    print(f"No data found in init directory, checking standard directory instead.")
+                
+                # Check if we have a last date, start from the next day
+                # Otherwise, use a default start date (e.g., 30 days ago)
+                if last_date:
+                    workflow_start_date = last_date + timedelta(days=1)
+                    
+                    # If the start date is today or in the future, we're already up to date
+                    today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+                    if workflow_start_date >= today:
+                        print(f"Init directory already up to date (last date: {last_date.strftime('%Y-%m-%d')})")
+                        print(f"No new data to process for {zone_str}. Skipping.")
+                        continue
+                    
+                    # Convert to string format for IMERG functions
+                    workflow_start_date_str = workflow_start_date.strftime('%Y%m%d')
+                    print(f"Starting data collection from {workflow_start_date.strftime('%Y-%m-%d')}")
+                else:
+                    # If no last date is found, use the provided start_date
+                    workflow_start_date_str = start_date
+                    workflow_start_date = datetime.strptime(workflow_start_date_str, '%Y%m%d')
+                    print(f"No existing data found. Using provided start date: {workflow_start_date.strftime('%Y-%m-%d')}")
+                
+                # End date is either today or the provided end_date
+                if end_date:
+                    workflow_end_date_str = end_date
+                    workflow_end_date = datetime.strptime(workflow_end_date_str, '%Y%m%d')
+                else:
+                    workflow_end_date = datetime.now()
+                    workflow_end_date_str = workflow_end_date.strftime('%Y%m%d')
+                
+                # Generate a list of dates to process
+                date_range = pd.date_range(start=workflow_start_date, end=workflow_end_date, freq='D')
+                dates_to_process = []
+                
+                # Check which dates need processing (not already processed)
+                for process_date in date_range:
+                    date_str = process_date.strftime('%Y%m%d')
+                    date_ddd = process_date.strftime('%Y%j')
+                    
+                    # Check if output files already exist for this date
+                    output_dir = f"{data_path}geofsm-input/processed/{zone_str}"
+                    processed_file = f"{output_dir}/imerg_{date_str}.csv"
+                    
+                    if os.path.exists(processed_file):
+                        print(f"Data for {date_str} already processed. Skipping.")
+                        continue
+                    
+                    dates_to_process.append((date_str, process_date))
+                
+                if not dates_to_process:
+                    print(f"All dates already processed for {zone_str}. Skipping entire zone.")
+                    continue
+                
+                print(f"Found {len(dates_to_process)} dates to process for {zone_str}")
+                
+                # Process all dates that need processing
+                for date_tuple in dates_to_process:
+                    date_str, process_date = date_tuple
+                    
+                    print(f"Processing {zone_str} for date {date_str}")
+                    
+                    # Get file list for this specific date
+                    print(f"Searching for IMERG files for {date_str}")
+                    file_list = get_imerg_files_task(date_str, date_str)
+                    
+                    if not file_list:
+                        print(f"No IMERG files found for {date_str}")
+                        continue
+                    
+                    print(f"Found {len(file_list)} IMERG files for {date_str}")
+                    
+                    # Download files
+                    download_dir = download_imerg_files(file_list, imerg_store)
+                    
+                    # Process data for this specific date
+                    imerg_data = process_imerg_data(download_dir, date_str, date_str)
+                    
+                    # Rename coordinates from x,y to lon,lat if needed
+                    imerg_data = rename_coordinates(imerg_data)
+                    
+                    # Process this zone for this specific date
+                    rain_file, zone_specific_file, base_rain_file, base_zone_specific_file = process_single_zone(
+                        data_path, imerg_data, zone_str, process_date, process_date
+                    )
+                    
+                    if rain_file and zone_specific_file:
+                        standard_files.extend([rain_file, zone_specific_file])
+                        base_files.extend([base_rain_file, base_zone_specific_file])
+                        print(f"Successfully processed {zone_str} for {date_str}")
+                
             except Exception as e:
                 print(f"Error processing zone {zone_str}: {e}")
         
-        print(f"Workflow completed successfully! Processed {len(output_files)} zones")
-        return {'txt_files': output_files}
+        print(f"Workflow completed successfully!")
+        print(f"Processed {len(standard_files)//2} zones")
+        print(f"Created {len(standard_files)} standard files (with forecast)")
+        print(f"Created {len(base_files)} base files (without forecast)")
+        
+        return {
+            'standard_files': standard_files,  # Files with forecast
+            'base_files': base_files           # Files without forecast
+        }
     except Exception as e:
         print(f"Error in workflow: {e}")
         raise
@@ -478,11 +707,10 @@ if __name__ == "__main__":
                         help=f'Start date in YYYYMMDD format (default: {yesterday})')
     parser.add_argument('--end-date', type=str, default="", 
                         help='End date in YYYYMMDD format (default: same as start-date)')
-    parser.add_argument('--copy-to-zone-wise', action='store_true', 
-                        help='Copy output files to zone_wise_txt_files directory')
     
     args = parser.parse_args()
     
     print(f"Processing IMERG data from {args.start_date} to {args.end_date or args.start_date}")
-    result = imerg_all_zones_workflow(args.start_date, args.end_date, args.copy_to_zone_wise)
-    print(f"Generated files: {result['txt_files']}")
+    result = imerg_all_zones_workflow(args.start_date, args.end_date)
+    print(f"Generated standard files (with forecast): {result['standard_files']}")
+    print(f"Generated base files (without forecast): {result['base_files']}")
